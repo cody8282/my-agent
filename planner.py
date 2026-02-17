@@ -8,24 +8,24 @@ in loops, and suggests recovery actions.
 from __future__ import annotations
 
 import logging
-from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# How many times the same (action_type, target) can repeat before considered stuck
+# How many times the same (action_type, target) can repeat in recent window before considered stuck
 STUCK_REPEAT_THRESHOLD = 3
 # How many consecutive failures before triggering recovery
 FAILURE_STREAK_THRESHOLD = 3
+# Size of recent action window for stuck detection
+RECENT_WINDOW = 10
 
 
 @dataclass
 class PlanState:
     """Tracks the agent's planning state across steps."""
     phase: str = "exploring"  # exploring, filling_form, submitting, navigating, verifying
-    completed_actions: list[dict[str, Any]] = field(default_factory=list)
-    action_counts: dict[str, int] = field(default_factory=dict)  # (type, target_hash) -> count
+    recent_action_keys: list[str] = field(default_factory=list)  # sliding window of action keys
     failure_streak: int = 0
     total_failures: int = 0
     last_url: str = ""
@@ -61,12 +61,15 @@ class Planner:
             self.state.url_visit_count[url_key] = self.state.url_visit_count.get(url_key, 0) + 1
             self.state.last_url = current_url
 
-        # Track action repetition
+        # Track action repetition in a recent sliding window
         if action:
             action_type = action.get("type", "")
             target = action.get("xpath", "") or action.get("selector", "") or action.get("css_selector", "") or action.get("url", "")
             action_key = f"{action_type}:{target[:60]}"
-            self.state.action_counts[action_key] = self.state.action_counts.get(action_key, 0) + 1
+            self.state.recent_action_keys.append(action_key)
+            # Keep only last RECENT_WINDOW actions
+            if len(self.state.recent_action_keys) > RECENT_WINDOW:
+                self.state.recent_action_keys = self.state.recent_action_keys[-RECENT_WINDOW:]
 
         # Check failure streak from history
         if history:
@@ -107,13 +110,17 @@ class Planner:
 
     def _detect_stuck(self):
         """Detect if the agent is stuck and suggest recovery."""
-        # Check action repetition
-        for action_key, count in self.state.action_counts.items():
+        # Check action repetition in recent window
+        recent_counts: dict[str, int] = {}
+        for key in self.state.recent_action_keys:
+            recent_counts[key] = recent_counts.get(key, 0) + 1
+
+        for action_key, count in recent_counts.items():
             if count >= STUCK_REPEAT_THRESHOLD:
                 self.state.is_stuck = True
                 action_type, target = action_key.split(":", 1) if ":" in action_key else (action_key, "")
                 self.state.recovery_suggestion = (
-                    f"Action '{action_type}' on '{target[:40]}' repeated {count} times. "
+                    f"Action '{action_type}' on '{target[:40]}' repeated {count} times in last {RECENT_WINDOW} steps. "
                     "Try a different approach: use an alternative selector, scroll to find the element, "
                     "or navigate to a different page."
                 )
