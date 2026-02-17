@@ -7,15 +7,14 @@ action parsing, and retry logic for each step of a web task.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 
-from action_parser import parse_llm_response
-from html_processor import InteractiveElement, elements_to_prompt, process_html
+from action_parser import extract_thinking, parse_llm_response
+from html_processor import InteractiveElement, compute_element_diff, elements_to_prompt, process_html
 from planner import Planner
 from prompts import SYSTEM_PROMPT, build_user_prompt, format_history
 from task_analyzer import TaskAnalysis, analyze_task, analysis_to_prompt
@@ -48,6 +47,8 @@ class WebAgent:
         self.planner = Planner()
         self._task_analysis: Optional[TaskAnalysis] = None
         self._current_task_id: Optional[str] = None
+        self._prev_elements: list[InteractiveElement] = []
+        self._reasoning_memory: list[str] = []
 
     async def decide_action(
         self,
@@ -66,11 +67,13 @@ class WebAgent:
         task_id = task.get("id", "")
         start = time.monotonic()
 
-        # Reset planner on new task
+        # Reset state on new task
         if task_id != self._current_task_id:
             self._current_task_id = task_id
             self.planner.reset()
             self._task_analysis = None
+            self._prev_elements = []
+            self._reasoning_memory = []
 
         # 1. Analyze task (once per task)
         if self._task_analysis is None:
@@ -84,6 +87,10 @@ class WebAgent:
         # 2. Process HTML → interactive elements + page summary
         elements, page_summary = process_html(snapshot_html)
         elements_text = elements_to_prompt(elements)
+
+        # 2b. Compute DOM diff from previous step
+        dom_diff = compute_element_diff(self._prev_elements, elements)
+        self._prev_elements = elements
 
         logger.info(
             f"Step {step_index}: {len(elements)} elements, "
@@ -103,7 +110,7 @@ class WebAgent:
             if last_h.get("text"):
                 last_action["text"] = last_h["text"]
 
-        plan_state = self.planner.update(last_action, history, url)
+        self.planner.update(last_action, history, url)
         planning_context = self.planner.get_context_for_prompt()
 
         # 5. Build prompt
@@ -111,6 +118,7 @@ class WebAgent:
         history_text = format_history(history)
 
         instruction = self._task_analysis.instruction
+        memory_text = self._build_memory_text()
         user_prompt = build_user_prompt(
             instruction=instruction,
             current_url=url,
@@ -120,14 +128,21 @@ class WebAgent:
             elements_text=elements_text,
             page_summary=page_summary,
             planning_context=planning_context,
+            dom_diff=dom_diff,
+            memory_text=memory_text,
+            form_warnings=self._check_form_completeness(elements),
         )
 
         # 6. Call LLM with fallback chain
-        action = await self._call_llm_with_fallback(
+        action, thinking = await self._call_llm_with_fallback(
             task_id=task_id,
             user_prompt=user_prompt,
             elements=elements,
         )
+
+        # 7. Store reasoning for memory
+        if thinking:
+            self._store_reasoning(step_index, thinking, action)
 
         elapsed = time.monotonic() - start
         if action:
@@ -144,10 +159,16 @@ class WebAgent:
 
         analysis = self._task_analysis
 
-        # Check URL targets
+        # Check URL targets using path-segment matching to avoid false positives
+        # e.g. "/cart" should not match "/discart"
         if analysis.url_targets:
+            from urllib.parse import urlparse
+            parsed = urlparse(current_url)
+            url_path = parsed.path.rstrip("/")
             url_matched = any(
-                target in current_url or current_url.endswith(target)
+                url_path == target.rstrip("/")
+                or url_path.endswith("/" + target.lstrip("/").rstrip("/"))
+                or target in current_url  # fallback for full URL targets
                 for target in analysis.url_targets
             )
             if not url_matched:
@@ -167,13 +188,100 @@ class WebAgent:
         has_criteria = bool(analysis.url_targets or analysis.required_text)
         return has_criteria
 
+    def _store_reasoning(self, step_index: int, thinking: str, action: Optional[dict]):
+        """Store LLM reasoning for rolling memory."""
+        action_desc = ""
+        if action:
+            action_desc = f" -> {action.get('type', '?')}"
+            if action.get("text"):
+                action_desc += f' "{action["text"][:25]}"'
+        entry = f"Step {step_index}: {thinking[:150]}{action_desc}"
+        self._reasoning_memory.append(entry)
+
+    def _build_memory_text(self) -> str:
+        """Build the Agent Memory section for the prompt."""
+        if not self._reasoning_memory:
+            return ""
+
+        # Keep last 5 entries in full detail
+        FULL_DETAIL_COUNT = 5
+        # Compress older entries to one-liners
+        MAX_COMPRESSED = 10
+
+        lines = ["## Agent Memory"]
+
+        if len(self._reasoning_memory) > FULL_DETAIL_COUNT:
+            compressed = self._reasoning_memory[:-FULL_DETAIL_COUNT]
+            # Only keep the most recent compressed entries
+            compressed = compressed[-MAX_COMPRESSED:]
+            lines.append("Previous steps (summary):")
+            for entry in compressed:
+                # Truncate to one line
+                short = entry[:100]
+                if len(entry) > 100:
+                    short += "..."
+                lines.append(f"  - {short}")
+
+        recent = self._reasoning_memory[-FULL_DETAIL_COUNT:]
+        if recent:
+            lines.append("Recent reasoning:")
+            for entry in recent:
+                lines.append(f"  - {entry}")
+
+        return "\n".join(lines)
+
+    def _check_form_completeness(self, elements: list[InteractiveElement]) -> str:
+        """Check for required form fields that are still empty.
+
+        Only shows form status when the page has at least 2 form input elements,
+        to avoid noise on non-form pages (e.g. search bars, login links).
+        """
+        form_inputs = [
+            e for e in elements
+            if not e.is_hidden
+            and e.tag in ("input", "textarea", "select")
+            and e.type not in ("hidden", "submit", "button", "file")
+        ]
+
+        # Skip form analysis if fewer than 2 visible form inputs
+        if len(form_inputs) < 2:
+            return ""
+
+        empty_required: list[str] = []
+        empty_optional: list[str] = []
+
+        for e in form_inputs:
+            label = e.placeholder or e.name or e.aria_label or e.id or e.type
+            if not label:
+                continue
+
+            has_value = bool(e.value)
+            if e.is_required and not has_value:
+                empty_required.append(f"{label} [{e.eid}] [required]")
+            elif not has_value and e.tag in ("input", "textarea") and e.type not in ("checkbox", "radio"):
+                empty_optional.append(f"{label} [{e.eid}]")
+
+        if not empty_required and not empty_optional:
+            return ""
+
+        lines = ["## Form Status"]
+        if empty_required:
+            lines.append("REQUIRED fields still empty (MUST fill before submitting):")
+            for field in empty_required[:10]:
+                lines.append(f"  * {field}")
+        if empty_optional and len(empty_optional) <= 6:
+            lines.append("Other empty fields:")
+            for field in empty_optional[:6]:
+                lines.append(f"  - {field}")
+        return "\n".join(lines)
+
     async def _call_llm_with_fallback(
         self,
         task_id: str,
         user_prompt: str,
         elements: list[InteractiveElement],
-    ) -> Optional[dict]:
-        """Call LLM with model fallback chain and retry logic."""
+    ) -> tuple[Optional[dict], str]:
+        """Call LLM with model fallback chain and retry logic. Returns (action, thinking)."""
         models = [self.model] + [m for m in MODEL_CHAIN if m != self.model]
 
         for model in models:
@@ -181,8 +289,9 @@ class WebAgent:
                 try:
                     content = await self._call_llm(task_id, model, user_prompt)
                     if content:
+                        thinking = extract_thinking(content)
                         action = parse_llm_response(content, elements)
-                        return action
+                        return action, thinking
                 except httpx.TimeoutException:
                     logger.warning(f"LLM timeout: model={model}, attempt={attempt + 1}")
                     continue
@@ -190,11 +299,9 @@ class WebAgent:
                     status = e.response.status_code
                     logger.warning(f"LLM HTTP error: model={model}, status={status}, attempt={attempt + 1}")
                     if status == 402:
-                        # Cost limit reached, stop trying
                         logger.error("Cost limit reached!")
-                        return None
+                        return None, ""
                     if status in (400, 422):
-                        # Model not supported, try next
                         break
                     continue
                 except Exception as e:
@@ -202,7 +309,7 @@ class WebAgent:
                     continue
 
         logger.error("All LLM calls failed")
-        return None
+        return None, ""
 
     async def _call_llm(self, task_id: str, model: str, user_prompt: str) -> Optional[str]:
         """Make a single LLM API call."""
