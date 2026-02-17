@@ -14,11 +14,14 @@ You are an expert autonomous web agent. You interact with web pages by outputtin
 You MUST output a JSON object with exactly this structure:
 {
   "thinking": "Your step-by-step reasoning about what to do next",
+  "plan": ["Step 1 description", "Step 2 description", ...],
   "action": {
     "type": "<action_type>",
     ...action-specific fields...
   }
 }
+
+The "plan" field is optional but recommended on the first step. It helps you stay on track across multiple steps.
 
 ## Available Actions
 
@@ -86,6 +89,7 @@ def build_user_prompt(
     dom_diff: str = "",
     memory_text: str = "",
     form_warnings: str = "",
+    plan_text: str = "",
 ) -> str:
     """Build the user prompt combining all context."""
     sections = []
@@ -96,6 +100,10 @@ def build_user_prompt(
     # Success criteria (prime the model with goals)
     if success_criteria:
         sections.append(success_criteria)
+
+    # Task plan (decomposition / progress)
+    if plan_text:
+        sections.append(plan_text)
 
     # Planning context (phase, stuck detection)
     if planning_context:

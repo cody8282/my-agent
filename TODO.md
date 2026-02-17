@@ -54,20 +54,9 @@ def _is_hidden(el):
     return False
 ```
 
-## 7. Explicit Task Decomposition (Low effort, Medium impact)
+## ~~7. Explicit Task Decomposition~~ (DONE)
 
-**Source:** Both Magnitude and Browser Use
-
-On step 0, ask the LLM to output a plan in the `thinking` field. Parse and store the plan steps. On subsequent steps, include the plan + current position in the prompt.
-
-**Where:** `agent.py` — add `_task_plan` field, parse from step 0 thinking
-
-```python
-# On step 0, add to prompt:
-# "First, create a step-by-step plan. List numbered steps in your thinking field."
-# Then parse: "Plan: 1) ... 2) ... 3) ..."
-# On subsequent steps, include: "Plan progress: [x] Step 1 [x] Step 2 [ ] Step 3"
-```
+Implemented in `action_parser.py` (`extract_plan`, `_parse_plan_from_text`), `agent.py` (`_task_plan`, `_plan_step`, `_build_plan_text`), and `prompts.py` (`plan_text` parameter).
 
 ## 8. Self-Verification / State Assertions (Medium effort, Medium impact)
 
@@ -151,7 +140,7 @@ Ask the LLM to output a `confidence` score (0-100) and an optional `fallback_act
 |---|------|--------|--------|-------------|
 | 5 | Element prioritization | Medium | Medium | rapidfuzz |
 | 6 | Visibility detection | Low | Medium | None |
-| 7 | Task decomposition | Low | Medium | None |
+| 7 | ~~Task decomposition~~ | ~~Low~~ | ~~Medium~~ | ~~DONE~~ |
 | 8 | Self-verification | Medium | Medium | DOM diff (done) |
 | 9 | Action validation | Low | Low-Med | rapidfuzz |
 | 10 | Fallback candidates | Low | Low | None |

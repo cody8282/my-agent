@@ -13,7 +13,7 @@ from typing import Optional
 
 import httpx
 
-from action_parser import extract_thinking, parse_llm_response
+from action_parser import extract_plan, extract_thinking, parse_llm_response
 from html_processor import InteractiveElement, compute_element_diff, elements_to_prompt, process_html
 from planner import Planner
 from prompts import SYSTEM_PROMPT, build_user_prompt, format_history
@@ -49,6 +49,8 @@ class WebAgent:
         self._current_task_id: Optional[str] = None
         self._prev_elements: list[InteractiveElement] = []
         self._reasoning_memory: list[str] = []
+        self._task_plan: list[str] = []
+        self._plan_step: int = 0
 
     async def decide_action(
         self,
@@ -74,6 +76,8 @@ class WebAgent:
             self._task_analysis = None
             self._prev_elements = []
             self._reasoning_memory = []
+            self._task_plan = []
+            self._plan_step = 0
 
         # 1. Analyze task (once per task)
         if self._task_analysis is None:
@@ -119,6 +123,7 @@ class WebAgent:
 
         instruction = self._task_analysis.instruction
         memory_text = self._build_memory_text()
+        plan_text = self._build_plan_text(step_index)
         user_prompt = build_user_prompt(
             instruction=instruction,
             current_url=url,
@@ -131,16 +136,28 @@ class WebAgent:
             dom_diff=dom_diff,
             memory_text=memory_text,
             form_warnings=self._check_form_completeness(elements),
+            plan_text=plan_text,
         )
 
         # 6. Call LLM with fallback chain
-        action, thinking = await self._call_llm_with_fallback(
+        action, thinking, raw_content = await self._call_llm_with_fallback(
             task_id=task_id,
             user_prompt=user_prompt,
             elements=elements,
         )
 
-        # 7. Store reasoning for memory
+        # 7. Parse plan on step 0, advance plan on later steps
+        if step_index == 0 and raw_content and not self._task_plan:
+            plan_steps = extract_plan(raw_content)
+            if plan_steps:
+                self._task_plan = plan_steps
+                logger.info(f"Task plan extracted: {len(plan_steps)} steps")
+        elif self._task_plan and action:
+            # Advance plan step when an action is taken
+            if self._plan_step < len(self._task_plan):
+                self._plan_step += 1
+
+        # 8. Store reasoning for memory
         if thinking:
             self._store_reasoning(step_index, thinking, action)
 
@@ -187,6 +204,37 @@ class WebAgent:
         # Only return True if we had criteria and all matched
         has_criteria = bool(analysis.url_targets or analysis.required_text)
         return has_criteria
+
+    def _build_plan_text(self, step_index: int) -> str:
+        """Build the task plan section for the prompt.
+
+        On step 0 (no plan yet), returns instructions to create a plan.
+        On later steps with a plan, returns plan progress with checkmarks.
+        """
+        if not self._task_plan:
+            if step_index == 0:
+                return (
+                    "## Task Planning\n"
+                    "This is the first step. Before acting, create a step-by-step plan to complete the task.\n"
+                    "Include a \"plan\" field in your JSON output as a list of short step descriptions.\n"
+                    "Example: \"plan\": [\"Navigate to login page\", \"Fill email field\", \"Fill password field\", \"Click submit\"]\n"
+                    "Then execute the first step of your plan in the \"action\" field."
+                )
+            return ""
+
+        lines = ["## Task Plan"]
+        for i, step in enumerate(self._task_plan):
+            if i < self._plan_step:
+                lines.append(f"  [x] {i + 1}. {step}")
+            elif i == self._plan_step:
+                lines.append(f"  --> {i + 1}. {step}  (CURRENT)")
+            else:
+                lines.append(f"  [ ] {i + 1}. {step}")
+
+        if self._plan_step >= len(self._task_plan):
+            lines.append("\nAll planned steps completed. Verify the task is done or add more steps if needed.")
+
+        return "\n".join(lines)
 
     def _store_reasoning(self, step_index: int, thinking: str, action: Optional[dict]):
         """Store LLM reasoning for rolling memory."""
@@ -280,8 +328,8 @@ class WebAgent:
         task_id: str,
         user_prompt: str,
         elements: list[InteractiveElement],
-    ) -> tuple[Optional[dict], str]:
-        """Call LLM with model fallback chain and retry logic. Returns (action, thinking)."""
+    ) -> tuple[Optional[dict], str, str]:
+        """Call LLM with model fallback chain and retry logic. Returns (action, thinking, raw_content)."""
         models = [self.model] + [m for m in MODEL_CHAIN if m != self.model]
 
         for model in models:
@@ -291,7 +339,7 @@ class WebAgent:
                     if content:
                         thinking = extract_thinking(content)
                         action = parse_llm_response(content, elements)
-                        return action, thinking
+                        return action, thinking, content
                 except httpx.TimeoutException:
                     logger.warning(f"LLM timeout: model={model}, attempt={attempt + 1}")
                     continue
@@ -300,7 +348,7 @@ class WebAgent:
                     logger.warning(f"LLM HTTP error: model={model}, status={status}, attempt={attempt + 1}")
                     if status == 402:
                         logger.error("Cost limit reached!")
-                        return None, ""
+                        return None, "", ""
                     if status in (400, 422):
                         break
                     continue
@@ -309,7 +357,7 @@ class WebAgent:
                     continue
 
         logger.error("All LLM calls failed")
-        return None, ""
+        return None, "", ""
 
     async def _call_llm(self, task_id: str, model: str, user_prompt: str) -> Optional[str]:
         """Make a single LLM API call."""

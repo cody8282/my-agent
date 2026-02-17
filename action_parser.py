@@ -79,8 +79,8 @@ REQUIRED_FIELDS = {
 }
 
 
-def extract_thinking(content: str) -> str:
-    """Extract the 'thinking' field from the LLM's JSON response."""
+def _parse_json_obj(content: str) -> Optional[dict]:
+    """Try to parse a JSON object from LLM output, handling markdown fences."""
     text = content.strip()
     if text.startswith("```"):
         lines = text.split("\n")
@@ -88,8 +88,8 @@ def extract_thinking(content: str) -> str:
         text = "\n".join(lines).strip()
     try:
         obj = json.loads(text)
-        if isinstance(obj, dict) and "thinking" in obj:
-            return str(obj["thinking"])
+        if isinstance(obj, dict):
+            return obj
     except json.JSONDecodeError:
         pass
     # Try outermost braces
@@ -98,11 +98,65 @@ def extract_thinking(content: str) -> str:
     if start != -1 and end > start:
         try:
             obj = json.loads(text[start:end + 1])
-            if isinstance(obj, dict) and "thinking" in obj:
-                return str(obj["thinking"])
+            if isinstance(obj, dict):
+                return obj
         except json.JSONDecodeError:
             pass
+    return None
+
+
+def extract_thinking(content: str) -> str:
+    """Extract the 'thinking' field from the LLM's JSON response."""
+    obj = _parse_json_obj(content)
+    if obj and "thinking" in obj:
+        return str(obj["thinking"])
     return ""
+
+
+def extract_plan(content: str) -> list[str]:
+    """Extract a plan from the LLM's JSON response.
+
+    Looks for a "plan" field (list of strings) in the JSON output.
+    Falls back to parsing numbered steps from the thinking field.
+    Returns a list of plan step strings, or empty list if no plan found.
+    """
+    obj = _parse_json_obj(content)
+    if not obj:
+        return []
+
+    # Try explicit "plan" field (list of strings)
+    plan = obj.get("plan")
+    if isinstance(plan, list) and plan:
+        return [str(s).strip() for s in plan if str(s).strip()]
+
+    # Fall back to parsing numbered steps from thinking
+    thinking = obj.get("thinking", "")
+    if not thinking:
+        return []
+
+    return _parse_plan_from_text(str(thinking))
+
+
+def _parse_plan_from_text(text: str) -> list[str]:
+    """Parse numbered plan steps from free text.
+
+    Matches patterns like:
+      1. Step one
+      1) Step one
+      Step 1: Do something
+    Works both with newline-separated and inline numbered lists.
+    """
+    steps: list[str] = []
+    # Match "1. ...", "1) ...", "Step 1: ..." — content ends at next number or end of string
+    for match in re.finditer(
+        r'(?:step\s+)?\d+[.):\-]\s*(.+?)(?=\s*(?:(?:step\s+)?\d+[.):\-])|$)',
+        text,
+        re.IGNORECASE,
+    ):
+        step_text = match.group(1).strip().rstrip(".")
+        if step_text and len(step_text) > 3:
+            steps.append(step_text)
+    return steps
 
 
 def parse_llm_response(content: str, elements: list[InteractiveElement]) -> Optional[dict]:
