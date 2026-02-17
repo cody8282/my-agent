@@ -1,0 +1,9 @@
+# Extra dependencies for your agent.
+#
+# The sandbox base image already includes:
+#   fastapi, uvicorn, httpx, pydantic, openai, beautifulsoup4, lxml,
+#   tenacity, requests, aiohttp, rapidfuzz, pillow, rich, orjson,
+#   jsonschema, markdownify, readability-lxml, tldextract
+#
+# Only add packages NOT in the base image.
+# See: autoppia_web_agents_subnet/opensource/sandbox/requirements.txt
