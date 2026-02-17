@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Optional
+from typing import Optional
 
 from html_processor import InteractiveElement
 
@@ -41,6 +41,20 @@ ACTION_TYPE_ALIASES = {
     "dropdown": "select_option",
     "scroll_down": "scroll",
     "scroll_up": "scroll",
+    "mouse_over": "hover",
+    "mouseover": "hover",
+    "hover_over": "hover",
+    "back": "go_back",
+    "go_back": "go_back",
+    "navigate_back": "go_back",
+    "browser_back": "go_back",
+    "forward": "go_forward",
+    "go_forward": "go_forward",
+    "press_key": "keys",
+    "key": "keys",
+    "keyboard": "keys",
+    "press_enter": "keys",
+    "send_keys": "keys",
     "none": "noop",
     "done": "noop",
     "complete": "noop",
@@ -57,8 +71,38 @@ REQUIRED_FIELDS = {
     "select_option": ["xpath", "text"],
     "navigate": ["url"],
     "scroll": [],
+    "hover": ["xpath"],
+    "keys": ["keys"],
+    "go_back": [],
+    "go_forward": [],
     "noop": [],
 }
+
+
+def extract_thinking(content: str) -> str:
+    """Extract the 'thinking' field from the LLM's JSON response."""
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "thinking" in obj:
+            return str(obj["thinking"])
+    except json.JSONDecodeError:
+        pass
+    # Try outermost braces
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            obj = json.loads(text[start:end + 1])
+            if isinstance(obj, dict) and "thinking" in obj:
+                return str(obj["thinking"])
+        except json.JSONDecodeError:
+            pass
+    return ""
 
 
 def parse_llm_response(content: str, elements: list[InteractiveElement]) -> Optional[dict]:
@@ -78,8 +122,10 @@ def parse_llm_response(content: str, elements: list[InteractiveElement]) -> Opti
 
     # Normalize action type
     action_type = action.get("type", "").lower().strip()
+    original_type = action_type
     action_type = ACTION_TYPE_ALIASES.get(action_type, action_type)
     action["type"] = action_type
+    action["_original_type"] = original_type
 
     if action_type == "noop":
         return None
@@ -87,6 +133,10 @@ def parse_llm_response(content: str, elements: list[InteractiveElement]) -> Opti
     if action_type not in REQUIRED_FIELDS:
         logger.warning(f"Unknown action type: {action_type}")
         return None
+
+    # Auto-set keys for press_enter alias before validation
+    if action_type == "keys" and original_type == "press_enter" and not action.get("keys"):
+        action["keys"] = "Enter"
 
     # Resolve eid references in xpath/selector
     action = _resolve_eids(action, elements)
@@ -117,6 +167,14 @@ def parse_llm_response(content: str, elements: list[InteractiveElement]) -> Opti
         clean["url"] = action["url"]
     if action_type == "scroll":
         clean["direction"] = action.get("direction", "down")
+    if action_type == "keys":
+        keys_val = action.get("keys", "") or action.get("key", "") or action.get("text", "")
+        # Auto-set "Enter" for press_enter alias when no keys specified
+        if not keys_val and action.get("_original_type") == "press_enter":
+            keys_val = "Enter"
+        clean["keys"] = str(keys_val)
+    if action_type in ("go_back", "go_forward"):
+        clean[action_type] = True
 
     return clean
 

@@ -40,7 +40,17 @@ You MUST output a JSON object with exactly this structure:
 6. **scroll** — Scroll the page (use when elements might be below viewport)
    {"type": "scroll", "direction": "down"}
 
-7. **noop** — Do nothing (task appears complete)
+7. **hover** — Hover over an element (reveals dropdown menus, tooltips)
+   {"type": "hover", "xpath": "//li[@class='menu-item']"}
+
+8. **keys** — Press keyboard keys (Enter, Tab, Escape, etc.)
+   {"type": "keys", "keys": "Enter"}
+   Common keys: "Enter" (submit forms), "Escape" (close modals), "Tab" (next field)
+
+9. **go_back** — Navigate back in browser history
+   {"type": "go_back"}
+
+10. **noop** — Do nothing (task appears complete)
    {"type": "noop"}
 
 ## Element References
@@ -57,6 +67,9 @@ You can also construct your own xpath if the element you need isn't listed.
 - If the task goal is already achieved on the current page, output {"type": "noop"} in the action.
 - Think step by step in the "thinking" field before deciding your action.
 - When filling forms, fill ALL required fields before clicking submit.
+- Use "hover" to reveal dropdown menus or hidden navigation items.
+- Use "keys" with "Enter" to submit forms instead of finding the submit button when convenient.
+- Use "go_back" when you navigated to a wrong page and need to return.
 """
 
 
@@ -70,6 +83,9 @@ def build_user_prompt(
     elements_text: str,
     page_summary: str,
     planning_context: str,
+    dom_diff: str = "",
+    memory_text: str = "",
+    form_warnings: str = "",
 ) -> str:
     """Build the user prompt combining all context."""
     sections = []
@@ -85,6 +101,10 @@ def build_user_prompt(
     if planning_context:
         sections.append(f"## Agent State\n{planning_context}")
 
+    # Agent memory (rolling reasoning from previous steps)
+    if memory_text:
+        sections.append(memory_text)
+
     # Current state
     sections.append(f"## Current URL\n{current_url}")
     sections.append(f"## Step\n{step_index} of 30")
@@ -92,6 +112,14 @@ def build_user_prompt(
     # History
     if history_text:
         sections.append(f"## Action History\n{history_text}")
+
+    # DOM diff (what changed since last step)
+    if dom_diff:
+        sections.append(dom_diff)
+
+    # Form warnings (required fields not yet filled)
+    if form_warnings:
+        sections.append(form_warnings)
 
     # Page content (interactive elements first, then summary)
     sections.append(f"## Page Elements\n{elements_text}")
