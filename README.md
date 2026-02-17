@@ -1,17 +1,50 @@
-# Autoppia Subnet 36 — Miner Agent Template
+# Autoppia Subnet 36 — SOTA Miner Web Agent
 
-A minimal template for building a web agent for [Autoppia Web Agents Subnet 36](https://github.com/autoppia/autoppia_web_agents_subnet).
+A high-performance web agent for [Autoppia Web Agents Subnet 36](https://github.com/autoppia/autoppia_web_agents_subnet). Built to maximize eval score on the Infinite Web Arena (IWA) benchmark.
 
-## How It Works
+## Architecture
 
-The validator clones this repo, builds it inside a hardened Docker sandbox, and evaluates it against web tasks. Your agent receives a task instruction + browser page HTML, and must return browser actions (click, fill, navigate, etc.) to complete the task.
+The agent uses a modular pipeline that processes each step:
+
+```
+/act request
+  │
+  ├── task_analyzer.py    Parse task tests → extract success criteria & sub-goals
+  ├── html_processor.py   Raw HTML → compact interactive elements + page summary
+  ├── planner.py          Track phase, detect stuck loops, suggest recovery
+  ├── prompts.py          Assemble system + user prompt with all context
+  │
+  ├── agent.py            Orchestrate pipeline, call LLM with fallback chain
+  ├── action_parser.py    Parse JSON response, resolve element IDs, validate
+  │
+  └── main.py             FastAPI entrypoint (/health, /act)
+```
+
+### Key Design Decisions
+
+- **Model: `gpt-4.1`** — Cost/time don't affect score (`COST_WEIGHT=0.0`, `TIME_WEIGHT=0.0`). Budget math: 30 steps x ~15K tokens = ~$1.60, well under the $10 limit. Fallback chain: `gpt-4.1` → `gpt-4o` → `gpt-4.1-mini`.
+
+- **HTML processing** — Extracts interactive elements (inputs, buttons, links, selects) with short IDs (`e1`, `e2`, ...) plus CSS selectors and XPaths. Saves ~80% tokens vs raw HTML. Page content summarized via readability + markdownify.
+
+- **Task test analysis** — Parses the task's `tests` array to extract URL targets, required text, required elements. Presents success criteria to the LLM *before* page content to prime its reasoning.
+
+- **Structured output** — `{"thinking": "...", "action": {...}}` gives chain-of-thought reasoning inside the gateway's forced `json_object` response format.
+
+- **Stuck detection** — Catches repeated actions (same target 3+ times) and failure streaks (3+ consecutive). Forces the LLM to try a different approach.
+
+- **Early completion** — Before calling the LLM, checks if URL/text criteria from task tests already pass. Returns NOOP to avoid breaking a passing state.
 
 ## Repo Structure
 
 ```
-main.py            # FastAPI app — entrypoint (validator runs: uvicorn main:app)
-agent.py           # Agent logic — LLM-based action decision
-requirements.txt   # Extra deps only (base image has many pre-installed)
+main.py              FastAPI entrypoint (validator runs: uvicorn main:app)
+agent.py             Orchestrator — coordinates all modules per step
+html_processor.py    DOM → interactive elements + page summary
+task_analyzer.py     Extract success criteria from task tests
+planner.py           Multi-step planning, stuck detection, recovery
+prompts.py           System and user prompt templates
+action_parser.py     Parse/validate LLM JSON, resolve element IDs
+requirements.txt     Extra deps (base image has many pre-installed)
 ```
 
 ## Required Endpoints
@@ -29,12 +62,15 @@ requirements.txt   # Extra deps only (base image has many pre-installed)
     "task": {
         "id": "task_abc123",
         "instruction": "Add the red shoes to your cart",
-        "url": "https://demo-store.com/..."
+        "url": "https://demo-store.com/...",
+        "tests": [...]
     },
     "snapshot_html": "<html>...</html>",
     "url": "https://demo-store.com/shoes",
     "step_index": 0,
-    "history": []
+    "history": [
+        {"step": 0, "action": "click", "text": null, "exec_ok": true, "error": null}
+    ]
 }
 ```
 
@@ -43,21 +79,22 @@ requirements.txt   # Extra deps only (base image has many pre-installed)
 [{"type": "click", "xpath": "//button[contains(text(), 'Add to Cart')]"}]
 ```
 
-Return `[]` to do nothing (NOOP).
+Return `[]` for NOOP (do nothing).
 
 ## Action Types
 
-| Type | Fields | Example |
-|------|--------|---------|
-| `click` | `xpath` | `{"type": "click", "xpath": "//button[@id='buy']"}` |
-| `fill` | `xpath`, `text` | `{"type": "fill", "xpath": "//input[@name='email']", "text": "a@b.com"}` |
-| `type` | `xpath`, `text` | `{"type": "type", "xpath": "//input[@name='q']", "text": "shoes"}` |
-| `select_option` | `xpath`, `text` | `{"type": "select_option", "xpath": "//select[@name='size']", "text": "L"}` |
-| `navigate` | `url` | `{"type": "navigate", "url": "https://example.com/cart"}` |
+| Type | Fields | Description |
+|------|--------|-------------|
+| `click` | `xpath` | Click an element |
+| `fill` | `xpath`, `text` | Clear input and type text |
+| `type` | `xpath`, `text` | Append text (no clear) |
+| `select_option` | `xpath`, `text` | Select dropdown option by visible text |
+| `navigate` | `url` | Go to a URL |
+| `scroll` | `direction` | Scroll page (`"up"` or `"down"`) |
 
 ## LLM Access
 
-Your agent accesses LLMs through the sandbox gateway (no direct internet). Environment variables are injected at runtime:
+The agent accesses LLMs through the sandbox gateway (no direct internet). Environment variables injected at runtime:
 
 | Variable | Value |
 |----------|-------|
@@ -65,7 +102,9 @@ Your agent accesses LLMs through the sandbox gateway (no direct internet). Envir
 | `CHUTES_BASE_URL` | `http://sandbox-gateway:9000/chutes/v1` |
 | `SANDBOX_AGENT_UID` | Your miner UID |
 
-Every LLM request **must** include the `iwa-task-id` header (from `task["id"]`), or the gateway rejects it.
+Every LLM request **must** include the `iwa-task-id` header (from `task["id"]`), or the gateway rejects it with 400.
+
+The gateway automatically forces `response_format=json_object` on chat completions, so the LLM always returns valid JSON.
 
 ## Sandbox Constraints
 
@@ -74,12 +113,30 @@ Every LLM request **must** include the `iwa-task-id` header (from `task["id"]`),
 - All Linux capabilities dropped
 - No direct internet — LLM calls go through the gateway only
 - Cost limit per task (default $10)
+- Max 30 steps per task evaluation
 
-## Local Testing with Benchmark
+## Pre-installed Packages
 
-The official benchmark framework (`autoppia_iwa`) uses a **different interface** (`/solve_task` with Flask) than the production sandbox (`/act` with FastAPI). This template targets the **production sandbox** — the interface that validators actually use for scoring on mainnet.
+The sandbox base image includes: `fastapi`, `uvicorn`, `httpx`, `pydantic`, `openai`, `beautifulsoup4`, `lxml`, `tenacity`, `requests`, `aiohttp`, `rapidfuzz`, `pillow`, `rich`, `orjson`, `jsonschema`, `markdownify`, `readability-lxml`, `tldextract`.
 
-To test locally with the benchmark, see the [Benchmark Guide](https://github.com/autoppia/autoppia_web_agents_subnet/blob/opensource/docs/advanced/benchmark-README.md) and adapt your agent to expose a `/solve_task` endpoint alongside `/act`, or create a separate benchmark-specific wrapper.
+Only add packages NOT in this list to `requirements.txt`.
+
+## Local Testing
+
+```bash
+# Create venv and install deps
+python3 -m venv .venv
+.venv/bin/pip install beautifulsoup4 lxml markdownify readability-lxml httpx fastapi uvicorn
+
+# Verify imports
+.venv/bin/python3 -c "from main import app; print('OK')"
+
+# Run locally (won't have LLM access without the gateway)
+.venv/bin/uvicorn main:app --port 8000
+
+# Test health endpoint
+curl http://localhost:8000/health
+```
 
 ## Miner Setup
 
