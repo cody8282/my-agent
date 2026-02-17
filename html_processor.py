@@ -51,6 +51,7 @@ class InteractiveElement:
     css_selector: str = ""
     xpath: str = ""
     is_hidden: bool = False
+    is_required: bool = False
 
     def to_compact(self) -> str:
         """Single-line compact representation for the LLM prompt."""
@@ -74,8 +75,12 @@ class InteractiveElement:
         if self.options:
             opts = ", ".join(self.options[:8])
             parts.append(f"options=[{opts}]")
+        if self.is_required:
+            parts.append("[required]")
         if self.is_hidden:
             parts.append("[hidden]")
+        # Always show xpath so the LLM knows how to target this element
+        parts.append(f'xpath="{self.xpath}"')
         return " ".join(parts)
 
 
@@ -93,15 +98,35 @@ def _get_text(el: Tag) -> str:
 
 
 def _is_hidden(el: Tag) -> bool:
-    style = (el.get("style") or "").lower()
-    if "display:none" in style.replace(" ", "") or "display: none" in style:
-        return True
-    if "visibility:hidden" in style.replace(" ", "") or "visibility: hidden" in style:
+    """Check if element is hidden via CSS, attributes, or parent chain."""
+    # Check element itself
+    if _has_hidden_style(el):
         return True
     if el.get("hidden") is not None:
         return True
     el_type = (el.get("type") or "").lower()
     if el_type == "hidden":
+        return True
+    if el.get("aria-hidden") == "true":
+        return True
+    # Check parent chain (up to 3 levels) for inherited hiding
+    for parent in list(el.parents)[:3]:
+        if isinstance(parent, Tag) and parent.name not in ("html", "body", "[document]"):
+            if _has_hidden_style(parent):
+                return True
+    return False
+
+
+def _has_hidden_style(el: Tag) -> bool:
+    """Check inline style for hidden indicators."""
+    style = (el.get("style") or "").lower().replace(" ", "")
+    if "display:none" in style:
+        return True
+    if "visibility:hidden" in style:
+        return True
+    if "opacity:0" in style:
+        return True
+    if "pointer-events:none" in style:
         return True
     return False
 
@@ -140,10 +165,15 @@ def _build_xpath(el: Tag) -> str:
     aria = el.get("aria-label", "")
     if aria:
         return f'//{tag}[@aria-label="{aria}"]'
-    # Text-based
+    # Text-based (avoid quotes in text that would break XPath)
     text = el.get_text(strip=True)
-    if text and len(text) < 50:
+    if text and len(text) < 50 and '"' not in text and "'" not in text:
         return f'//{tag}[contains(text(), "{text[:40]}")]'
+    # Class-based fallback
+    classes = el.get("class", [])
+    if classes:
+        first_cls = classes[0]
+        return f'//{tag}[contains(@class, "{first_cls}")]'
     # Positional fallback
     return f"//{tag}"
 
@@ -186,14 +216,14 @@ def extract_elements(html: str) -> list[InteractiveElement]:
         if eid_counter >= MAX_ELEMENTS:
             break
 
-        eid_counter += 1
-        eid = f"e{eid_counter}"
-
         css_sel = _build_css_selector(el)
-        # Deduplicate by css_selector
+        # Deduplicate by css_selector (skip bare tag-only selectors from dedup)
         if css_sel in seen_selectors and css_sel != el.name:
             continue
         seen_selectors.add(css_sel)
+
+        eid_counter += 1
+        eid = f"e{eid_counter}"
 
         xpath = _build_xpath(el)
 
@@ -207,6 +237,9 @@ def extract_elements(html: str) -> list[InteractiveElement]:
                     options.append(opt_text)
                 elif opt_val:
                     options.append(opt_val)
+
+        # Detect required attribute
+        is_required = el.get("required") is not None or (el.get("aria-required") or "").lower() == "true"
 
         elem = InteractiveElement(
             eid=eid,
@@ -225,6 +258,7 @@ def extract_elements(html: str) -> list[InteractiveElement]:
             css_selector=css_sel,
             xpath=xpath,
             is_hidden=_is_hidden(el),
+            is_required=is_required,
         )
         elements.append(elem)
 
@@ -270,6 +304,87 @@ def process_html(html: str) -> tuple[list[InteractiveElement], str]:
     elements = extract_elements(html)
     summary = get_page_summary(html)
     return elements, summary
+
+
+def compute_element_diff(
+    prev_elements: list[InteractiveElement],
+    curr_elements: list[InteractiveElement],
+) -> str:
+    """
+    Compute a human-readable diff between two element snapshots.
+    Returns a compact string describing new, removed, and changed elements.
+    """
+    if not prev_elements:
+        return ""
+
+    # Build a stable identity key for diffing across steps.
+    # Use css_selector + tag + differentiators to avoid collisions
+    # when multiple elements share a bare tag selector.
+    def _key(e: InteractiveElement) -> str:
+        extra = e.name or e.id or e.placeholder or e.text[:20] if e.text else ""
+        return f"{e.tag}|{e.css_selector}|{extra}"
+
+    prev_map = {_key(e): e for e in prev_elements}
+    curr_map = {_key(e): e for e in curr_elements}
+
+    prev_keys = set(prev_map.keys())
+    curr_keys = set(curr_map.keys())
+
+    new_keys = curr_keys - prev_keys
+    removed_keys = prev_keys - curr_keys
+    common_keys = prev_keys & curr_keys
+
+    lines: list[str] = []
+
+    # New elements (limit to 10 most important)
+    new_elements = [curr_map[k] for k in new_keys]
+    if new_elements:
+        for e in new_elements[:10]:
+            desc = e.tag
+            if e.text:
+                desc += f' "{_trunc(e.text, 30)}"'
+            elif e.placeholder:
+                desc += f' placeholder="{e.placeholder}"'
+            elif e.name:
+                desc += f' name="{e.name}"'
+            lines.append(f"  + NEW [{e.eid}] {desc}")
+        if len(new_elements) > 10:
+            lines.append(f"  + ... and {len(new_elements) - 10} more new elements")
+
+    # Removed elements (limit to 5)
+    removed_elements = [prev_map[k] for k in removed_keys]
+    if removed_elements:
+        for e in removed_elements[:5]:
+            desc = e.tag
+            if e.text:
+                desc += f' "{_trunc(e.text, 30)}"'
+            elif e.name:
+                desc += f' name="{e.name}"'
+            lines.append(f"  - REMOVED [{e.eid}] {desc}")
+        if len(removed_elements) > 5:
+            lines.append(f"  - ... and {len(removed_elements) - 5} more removed")
+
+    # Changed elements (value changes — important for form state)
+    for key in common_keys:
+        prev_e = prev_map[key]
+        curr_e = curr_map[key]
+        changes = []
+        if prev_e.value != curr_e.value:
+            changes.append(f'value: "{_trunc(prev_e.value, 20)}" -> "{_trunc(curr_e.value, 20)}"')
+        if prev_e.text != curr_e.text and prev_e.tag not in ("a",):
+            changes.append(f'text: "{_trunc(prev_e.text, 20)}" -> "{_trunc(curr_e.text, 20)}"')
+        if prev_e.is_hidden != curr_e.is_hidden:
+            changes.append(f'visibility: {"hidden" if curr_e.is_hidden else "visible"}')
+        if changes:
+            desc = curr_e.tag
+            if curr_e.name:
+                desc += f' name="{curr_e.name}"'
+            lines.append(f"  ~ CHANGED [{curr_e.eid}] {desc}: {'; '.join(changes)}")
+
+    if not lines:
+        return ""
+
+    return "## Page Changes Since Last Step\n" + "\n".join(lines)
 
 
 def elements_to_prompt(elements: list[InteractiveElement]) -> str:
