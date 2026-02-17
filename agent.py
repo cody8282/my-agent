@@ -1,122 +1,53 @@
 """
-Web agent logic — decides what browser action to take given a task and page snapshot.
+SOTA Web Agent — Orchestrator module.
 
-Replace or extend this with your own agent strategy.
+Coordinates HTML processing, task analysis, planning, LLM calls,
+action parsing, and retry logic for each step of a web task.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Optional
 
 import httpx
 
+from action_parser import parse_llm_response
+from html_processor import InteractiveElement, elements_to_prompt, process_html
+from planner import Planner
+from prompts import SYSTEM_PROMPT, build_user_prompt, format_history
+from task_analyzer import TaskAnalysis, analyze_task, analysis_to_prompt
+
 logger = logging.getLogger(__name__)
 
-# Maximum HTML characters to include in the LLM prompt to stay within context limits.
-MAX_HTML_CHARS = 30_000
+# Model fallback chain: strongest → fallback → budget
+MODEL_CHAIN = ["gpt-4.1", "gpt-4o", "gpt-4.1-mini"]
 
-SYSTEM_PROMPT = """\
-You are an autonomous web agent. You interact with web pages by outputting a single JSON action per step.
+# LLM call timeout
+LLM_TIMEOUT = 55.0
 
-Available action types:
-  {"type": "click", "xpath": "//button[@id='submit']"}
-  {"type": "fill", "xpath": "//input[@name='email']", "text": "user@test.com"}
-  {"type": "type", "xpath": "//input[@name='search']", "text": "laptop"}
-  {"type": "select_option", "xpath": "//select[@name='qty']", "text": "2"}
-  {"type": "navigate", "url": "https://example.com/products"}
-
-Rules:
-- Output ONLY a single JSON object, no markdown fences, no explanation.
-- Use precise XPath selectors derived from the provided HTML.
-- Use "fill" for input fields (clears existing text first), "type" to append.
-- Use "navigate" only when you need to go to a completely different page.
-- If the task appears complete or you cannot determine a useful action, output: {"type": "noop"}
-"""
-
-
-def _build_user_prompt(
-    task: dict,
-    snapshot_html: str,
-    url: str,
-    step_index: int,
-    history: list[dict],
-) -> str:
-    instruction = task.get("instruction", "") or task.get("prompt", "") or task.get("objective", "")
-    truncated_html = snapshot_html[:MAX_HTML_CHARS]
-
-    history_summary = ""
-    if history:
-        lines = []
-        for h in history:
-            status = "OK" if h.get("exec_ok", True) else f"FAILED: {h.get('error', '?')}"
-            lines.append(f"  step {h.get('step', '?')}: {h.get('action', '?')} -> {status}")
-        history_summary = "Previous actions:\n" + "\n".join(lines) + "\n\n"
-
-    return (
-        f"Task: {instruction}\n\n"
-        f"Current URL: {url}\n"
-        f"Step: {step_index}\n\n"
-        f"{history_summary}"
-        f"Current page HTML:\n{truncated_html}\n\n"
-        f"Decide the next action. Output a single JSON object."
-    )
-
-
-def _parse_action(content: str) -> Optional[dict]:
-    """Try to extract a JSON action from LLM output, tolerating markdown fences."""
-    text = content.strip()
-
-    # Strip markdown code fences if present
-    if text.startswith("```"):
-        lines = text.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        text = "\n".join(lines).strip()
-
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict) and "type" in obj:
-            if obj["type"] == "noop":
-                return None
-            return obj
-    except json.JSONDecodeError:
-        pass
-
-    # Fallback: find first {...} in the output
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
-        try:
-            obj = json.loads(text[start : end + 1])
-            if isinstance(obj, dict) and "type" in obj:
-                if obj["type"] == "noop":
-                    return None
-                return obj
-        except json.JSONDecodeError:
-            pass
-
-    logger.warning("Could not parse action from LLM output: %s", text[:200])
-    return None
+# Max retries per step (for transient LLM failures)
+MAX_RETRIES_PER_STEP = 2
 
 
 class WebAgent:
     """
-    Simple LLM-based web agent.
-
-    Sends the task instruction + page HTML to an OpenAI-compatible chat endpoint
-    (via the sandbox gateway) and parses the response into a browser action.
+    SOTA LLM-based web agent with HTML processing, task analysis,
+    planning, and structured output.
     """
 
     def __init__(
         self,
         openai_base_url: str,
-        model: str = "gpt-4o-mini",
-        timeout: float = 60.0,
+        model: str = "gpt-4.1",
     ):
         self.openai_base_url = openai_base_url.rstrip("/")
         self.model = model
-        self.timeout = timeout
+        self.planner = Planner()
+        self._task_analysis: Optional[TaskAnalysis] = None
+        self._current_task_id: Optional[str] = None
 
     async def decide_action(
         self,
@@ -127,20 +58,163 @@ class WebAgent:
         step_index: int,
         history: list[dict],
     ) -> Optional[dict]:
-        task_id = task.get("id", "")
-        user_prompt = _build_user_prompt(task, snapshot_html, url, step_index, history)
+        """
+        Main entry point: given task + page state, return the next action.
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        Returns an action dict or None for NOOP.
+        """
+        task_id = task.get("id", "")
+        start = time.monotonic()
+
+        # Reset planner on new task
+        if task_id != self._current_task_id:
+            self._current_task_id = task_id
+            self.planner.reset()
+            self._task_analysis = None
+
+        # 1. Analyze task (once per task)
+        if self._task_analysis is None:
+            self._task_analysis = analyze_task(task)
+            logger.info(
+                f"Task analysis: type={self._task_analysis.task_type}, "
+                f"hints={len(self._task_analysis.completion_hints)}, "
+                f"url_targets={len(self._task_analysis.url_targets)}"
+            )
+
+        # 2. Process HTML → interactive elements + page summary
+        elements, page_summary = process_html(snapshot_html)
+        elements_text = elements_to_prompt(elements)
+
+        logger.info(
+            f"Step {step_index}: {len(elements)} elements, "
+            f"page_summary={len(page_summary)} chars, url={url[:80]}"
+        )
+
+        # 3. Check early completion (URL-based)
+        if self._check_early_completion(url, snapshot_html):
+            logger.info(f"Early completion detected at step {step_index}")
+            return None
+
+        # 4. Update planner
+        last_action = None
+        if history:
+            last_h = history[-1]
+            last_action = {"type": last_h.get("action", "")}
+            if last_h.get("text"):
+                last_action["text"] = last_h["text"]
+
+        plan_state = self.planner.update(last_action, history, url)
+        planning_context = self.planner.get_context_for_prompt()
+
+        # 5. Build prompt
+        success_criteria = analysis_to_prompt(self._task_analysis)
+        history_text = format_history(history)
+
+        instruction = self._task_analysis.instruction
+        user_prompt = build_user_prompt(
+            instruction=instruction,
+            current_url=url,
+            step_index=step_index,
+            history_text=history_text,
+            success_criteria=success_criteria,
+            elements_text=elements_text,
+            page_summary=page_summary,
+            planning_context=planning_context,
+        )
+
+        # 6. Call LLM with fallback chain
+        action = await self._call_llm_with_fallback(
+            task_id=task_id,
+            user_prompt=user_prompt,
+            elements=elements,
+        )
+
+        elapsed = time.monotonic() - start
+        if action:
+            logger.info(f"Step {step_index} decided: {action.get('type')} in {elapsed:.1f}s")
+        else:
+            logger.info(f"Step {step_index} decided: NOOP in {elapsed:.1f}s")
+
+        return action
+
+    def _check_early_completion(self, current_url: str, html: str) -> bool:
+        """Check if task appears already complete based on test criteria."""
+        if not self._task_analysis:
+            return False
+
+        analysis = self._task_analysis
+
+        # Check URL targets
+        if analysis.url_targets:
+            url_matched = any(
+                target in current_url or current_url.endswith(target)
+                for target in analysis.url_targets
+            )
+            if not url_matched:
+                return False
+
+        # Check required text
+        if analysis.required_text:
+            html_lower = html.lower()
+            text_matched = all(
+                text.lower() in html_lower
+                for text in analysis.required_text
+            )
+            if not text_matched:
+                return False
+
+        # Only return True if we had criteria and all matched
+        has_criteria = bool(analysis.url_targets or analysis.required_text)
+        return has_criteria
+
+    async def _call_llm_with_fallback(
+        self,
+        task_id: str,
+        user_prompt: str,
+        elements: list[InteractiveElement],
+    ) -> Optional[dict]:
+        """Call LLM with model fallback chain and retry logic."""
+        models = [self.model] + [m for m in MODEL_CHAIN if m != self.model]
+
+        for model in models:
+            for attempt in range(MAX_RETRIES_PER_STEP):
+                try:
+                    content = await self._call_llm(task_id, model, user_prompt)
+                    if content:
+                        action = parse_llm_response(content, elements)
+                        return action
+                except httpx.TimeoutException:
+                    logger.warning(f"LLM timeout: model={model}, attempt={attempt + 1}")
+                    continue
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code
+                    logger.warning(f"LLM HTTP error: model={model}, status={status}, attempt={attempt + 1}")
+                    if status == 402:
+                        # Cost limit reached, stop trying
+                        logger.error("Cost limit reached!")
+                        return None
+                    if status in (400, 422):
+                        # Model not supported, try next
+                        break
+                    continue
+                except Exception as e:
+                    logger.warning(f"LLM error: model={model}, attempt={attempt + 1}: {e}")
+                    continue
+
+        logger.error("All LLM calls failed")
+        return None
+
+    async def _call_llm(self, task_id: str, model: str, user_prompt: str) -> Optional[str]:
+        """Make a single LLM API call."""
+        async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
             resp = await client.post(
                 f"{self.openai_base_url}/chat/completions",
                 headers={
                     "Content-Type": "application/json",
-                    # REQUIRED: the gateway uses this header for cost tracking.
-                    # Without it, the request is rejected with 400.
                     "iwa-task-id": task_id,
                 },
                 json={
-                    "model": self.model,
+                    "model": model,
                     "messages": [
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": user_prompt},
@@ -150,9 +224,8 @@ class WebAgent:
             )
 
         if resp.status_code != 200:
-            logger.error("LLM request failed: status=%d body=%s", resp.status_code, resp.text[:300])
-            return None
+            resp.raise_for_status()
 
         data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        return _parse_action(content)
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return content if content else None
