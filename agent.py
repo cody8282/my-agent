@@ -50,7 +50,6 @@ class WebAgent:
         self._prev_elements: list[InteractiveElement] = []
         self._reasoning_memory: list[str] = []
         self._task_plan: list[str] = []
-        self._plan_step: int = 0
 
     async def decide_action(
         self,
@@ -77,7 +76,6 @@ class WebAgent:
             self._prev_elements = []
             self._reasoning_memory = []
             self._task_plan = []
-            self._plan_step = 0
 
         # 1. Analyze task (once per task)
         if self._task_analysis is None:
@@ -146,16 +144,12 @@ class WebAgent:
             elements=elements,
         )
 
-        # 7. Parse plan on step 0, advance plan on later steps
-        if step_index == 0 and raw_content and not self._task_plan:
+        # 7. Parse plan from early steps (try until we get one)
+        if raw_content and not self._task_plan and step_index <= 2:
             plan_steps = extract_plan(raw_content)
             if plan_steps:
                 self._task_plan = plan_steps
                 logger.info(f"Task plan extracted: {len(plan_steps)} steps")
-        elif self._task_plan and action:
-            # Advance plan step when an action is taken
-            if self._plan_step < len(self._task_plan):
-                self._plan_step += 1
 
         # 8. Store reasoning for memory
         if thinking:
@@ -209,7 +203,8 @@ class WebAgent:
         """Build the task plan section for the prompt.
 
         On step 0 (no plan yet), returns instructions to create a plan.
-        On later steps with a plan, returns plan progress with checkmarks.
+        On later steps with a plan, shows the plan as a reference list.
+        The LLM determines its own progress from the action history.
         """
         if not self._task_plan:
             if step_index == 0:
@@ -217,22 +212,14 @@ class WebAgent:
                     "## Task Planning\n"
                     "This is the first step. Before acting, create a step-by-step plan to complete the task.\n"
                     "Include a \"plan\" field in your JSON output as a list of short step descriptions.\n"
-                    "Example: \"plan\": [\"Navigate to login page\", \"Fill email field\", \"Fill password field\", \"Click submit\"]\n"
                     "Then execute the first step of your plan in the \"action\" field."
                 )
             return ""
 
         lines = ["## Task Plan"]
         for i, step in enumerate(self._task_plan):
-            if i < self._plan_step:
-                lines.append(f"  [x] {i + 1}. {step}")
-            elif i == self._plan_step:
-                lines.append(f"  --> {i + 1}. {step}  (CURRENT)")
-            else:
-                lines.append(f"  [ ] {i + 1}. {step}")
-
-        if self._plan_step >= len(self._task_plan):
-            lines.append("\nAll planned steps completed. Verify the task is done or add more steps if needed.")
+            lines.append(f"  {i + 1}. {step}")
+        lines.append("\nRefer to your action history to determine which steps are complete. Execute the next incomplete step.")
 
         return "\n".join(lines)
 

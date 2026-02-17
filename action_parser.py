@@ -140,12 +140,20 @@ def extract_plan(content: str) -> list[str]:
 def _parse_plan_from_text(text: str) -> list[str]:
     """Parse numbered plan steps from free text.
 
+    Only parses when the text contains plan-like keywords (plan, steps, first, etc.)
+    to avoid false positives on arbitrary numbered content.
+
     Matches patterns like:
       1. Step one
       1) Step one
       Step 1: Do something
-    Works both with newline-separated and inline numbered lists.
     """
+    # Only try parsing if text looks like it contains a plan
+    text_lower = text.lower()
+    plan_keywords = ("plan", "steps", "first", "step 1", "1.", "1)")
+    if not any(kw in text_lower for kw in plan_keywords):
+        return []
+
     steps: list[str] = []
     # Match "1. ...", "1) ...", "Step 1: ..." — content ends at next number or end of string
     for match in re.finditer(
@@ -156,7 +164,9 @@ def _parse_plan_from_text(text: str) -> list[str]:
         step_text = match.group(1).strip().rstrip(".")
         if step_text and len(step_text) > 3:
             steps.append(step_text)
-    return steps
+
+    # Require at least 2 steps to count as a plan (single numbered item isn't a plan)
+    return steps if len(steps) >= 2 else []
 
 
 def parse_llm_response(content: str, elements: list[InteractiveElement]) -> Optional[dict]:
@@ -223,9 +233,6 @@ def parse_llm_response(content: str, elements: list[InteractiveElement]) -> Opti
         clean["direction"] = action.get("direction", "down")
     if action_type == "keys":
         keys_val = action.get("keys", "") or action.get("key", "") or action.get("text", "")
-        # Auto-set "Enter" for press_enter alias when no keys specified
-        if not keys_val and action.get("_original_type") == "press_enter":
-            keys_val = "Enter"
         clean["keys"] = str(keys_val)
     if action_type in ("go_back", "go_forward"):
         clean[action_type] = True

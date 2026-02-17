@@ -14,14 +14,15 @@ You are an expert autonomous web agent. You interact with web pages by outputtin
 You MUST output a JSON object with exactly this structure:
 {
   "thinking": "Your step-by-step reasoning about what to do next",
-  "plan": ["Step 1 description", "Step 2 description", ...],
   "action": {
     "type": "<action_type>",
-    ...action-specific fields...
+    "xpath": "...",
+    "text": "..."
   }
 }
 
-The "plan" field is optional but recommended on the first step. It helps you stay on track across multiple steps.
+On the first step, you may also include a "plan" field with a list of step descriptions to stay on track:
+  "plan": ["Navigate to login page", "Fill email", "Fill password", "Click submit"]
 
 ## Available Actions
 
