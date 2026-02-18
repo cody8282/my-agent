@@ -14,7 +14,7 @@ from typing import Optional
 import httpx
 
 from action_parser import extract_plan, extract_thinking, parse_llm_response
-from html_processor import InteractiveElement, compute_element_diff, elements_to_prompt, process_html
+from html_processor import InteractiveElement, compute_element_diff, elements_to_prompt, extract_elements, process_html
 from planner import Planner
 from prompts import SYSTEM_PROMPT, build_user_prompt, format_history
 from task_analyzer import TaskAnalysis, analyze_task, analysis_to_prompt
@@ -37,6 +37,13 @@ class WebAgent:
     planning, and structured output.
     """
 
+    # Multi-turn context settings
+    _MAX_HISTORY_TURNS = 2   # turns to keep (each turn = user + assistant msg)
+    _MAX_STORED_USER_CHARS = 4000   # truncation limit for stored user messages
+    _MAX_STORED_ASSISTANT_CHARS = 2000  # truncation limit for stored assistant messages
+    # Minimum elements before adaptive fallback triggers
+    _MIN_ELEMENTS_FOR_MODE = 5
+
     def __init__(
         self,
         openai_base_url: str,
@@ -56,6 +63,7 @@ class WebAgent:
         self._prev_page_summary: str = ""
         self._last_action: Optional[dict] = None
         self._stale_count: int = 0
+        self._llm_history: list[dict] = []
 
     async def decide_action(
         self,
@@ -86,18 +94,30 @@ class WebAgent:
             self._prev_page_summary = ""
             self._last_action = None
             self._stale_count = 0
+            self._llm_history = []
 
         # 1. Analyze task (once per task)
         if self._task_analysis is None:
             self._task_analysis = analyze_task(task)
             logger.info(
                 f"Task analysis: type={self._task_analysis.task_type}, "
+                f"extraction_mode={self._task_analysis.extraction_mode}, "
                 f"hints={len(self._task_analysis.completion_hints)}, "
                 f"url_targets={len(self._task_analysis.url_targets)}"
             )
 
         # 2. Process HTML → interactive elements + page summary
-        elements, page_summary = process_html(snapshot_html)
+        extraction_mode = self._task_analysis.extraction_mode
+        elements, page_summary = process_html(snapshot_html, mode=extraction_mode)
+
+        # Adaptive fallback: if filtered mode yields too few elements, re-extract with all_fields
+        if extraction_mode != "all_fields" and len(elements) < self._MIN_ELEMENTS_FOR_MODE:
+            logger.info(
+                f"Extraction mode '{extraction_mode}' yielded {len(elements)} elements, "
+                f"falling back to 'all_fields'"
+            )
+            elements = extract_elements(snapshot_html, mode="all_fields")
+
         elements_text = elements_to_prompt(elements)
 
         # 2b. Compute DOM diff from previous step
@@ -478,13 +498,34 @@ class WebAgent:
         """Call LLM with model fallback chain and retry logic. Returns (action, thinking, raw_content)."""
         models = [self.model] + [m for m in MODEL_CHAIN if m != self.model]
 
+        # Build multi-turn messages: system + historical turns + current user prompt
+        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        # Append last N turns from history (each turn = user msg + assistant msg)
+        history_msgs = self._llm_history[-(self._MAX_HISTORY_TURNS * 2):]
+        messages.extend(history_msgs)
+
+        # Current user prompt (always sent in full)
+        messages.append({"role": "user", "content": user_prompt})
+
         for model in models:
             for attempt in range(MAX_RETRIES_PER_STEP):
                 try:
-                    content = await self._call_llm(task_id, model, user_prompt)
+                    content = await self._call_llm(task_id, model, messages)
                     if content:
                         thinking = extract_thinking(content)
                         action = parse_llm_response(content, elements)
+
+                        # Store turn in history (truncate for token management)
+                        stored_user = user_prompt[:self._MAX_STORED_USER_CHARS]
+                        stored_assistant = content[:self._MAX_STORED_ASSISTANT_CHARS]
+                        self._llm_history.append({"role": "user", "content": stored_user})
+                        self._llm_history.append({"role": "assistant", "content": stored_assistant})
+                        # Trim to max turns
+                        max_msgs = self._MAX_HISTORY_TURNS * 2
+                        if len(self._llm_history) > max_msgs:
+                            self._llm_history = self._llm_history[-max_msgs:]
+
                         return action, thinking, content
                 except httpx.TimeoutException:
                     logger.warning(f"LLM timeout: model={model}, attempt={attempt + 1}")
@@ -505,7 +546,7 @@ class WebAgent:
         logger.error("All LLM calls failed")
         return None, "", ""
 
-    async def _call_llm(self, task_id: str, model: str, user_prompt: str) -> Optional[str]:
+    async def _call_llm(self, task_id: str, model: str, messages: list[dict]) -> Optional[str]:
         """Make a single LLM API call."""
         async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
             resp = await client.post(
@@ -517,10 +558,7 @@ class WebAgent:
                 },
                 json={
                     "model": model,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
+                    "messages": messages,
                     "temperature": 0.0,
                 },
             )

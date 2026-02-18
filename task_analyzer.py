@@ -14,6 +14,13 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Map task types to DOM extraction modes
+_EXTRACTION_MODE_MAP = {
+    "form_fill": "input_fields",
+    "login": "input_fields",
+    "navigation": "links_only",
+}
+
 
 @dataclass
 class TaskAnalysis:
@@ -24,6 +31,7 @@ class TaskAnalysis:
     required_elements: list[str] = field(default_factory=list)  # Elements that must exist
     completion_hints: list[str] = field(default_factory=list)  # Human-readable goals
     instruction: str = ""
+    extraction_mode: str = "all_fields"  # input_fields, links_only, all_fields
 
 
 def _extract_from_test(test: Any) -> dict[str, list[str]]:
@@ -143,6 +151,7 @@ def analyze_task(task: dict[str, Any]) -> TaskAnalysis:
 
     analysis = TaskAnalysis(instruction=instruction)
     analysis.task_type = _infer_task_type(instruction)
+    analysis.extraction_mode = _EXTRACTION_MODE_MAP.get(analysis.task_type, "all_fields")
 
     for test in tests:
         try:

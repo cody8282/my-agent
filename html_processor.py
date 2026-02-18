@@ -32,6 +32,13 @@ MAX_TEXT_LEN = 80
 MAX_ELEMENTS = 150
 MAX_CONTENT_CHARS = 12000
 
+# Extraction modes: tag filters for adaptive DOM extraction
+EXTRACTION_MODES: dict[str, Optional[set[str]]] = {
+    "input_fields": {"input", "select", "textarea", "button"},
+    "links_only": {"a", "button"},
+    "all_fields": None,  # no filter, current behavior
+}
+
 
 @dataclass
 class InteractiveElement:
@@ -197,12 +204,29 @@ def _is_interactive(el: Tag) -> bool:
     return False
 
 
-def extract_elements(html: str) -> list[InteractiveElement]:
-    """Extract all interactive elements from HTML."""
+def _has_non_tag_interactivity(el: Tag) -> bool:
+    """Check if element is interactive via role, attr, tabindex, or contenteditable (not just its tag)."""
+    if any(el.get(attr) for attr in INTERACTIVE_ATTRS):
+        return True
+    role = (el.get("role") or "").lower()
+    if role in INTERACTIVE_ROLES:
+        return True
+    if el.get("contenteditable") in ("true", ""):
+        return True
+    tabindex = el.get("tabindex")
+    if tabindex is not None and tabindex != "-1":
+        return True
+    return False
+
+
+def extract_elements(html: str, mode: str = "all_fields") -> list[InteractiveElement]:
+    """Extract interactive elements from HTML, optionally filtered by mode."""
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
         soup = BeautifulSoup(html, "html.parser")
+
+    tag_filter = EXTRACTION_MODES.get(mode)
 
     elements: list[InteractiveElement] = []
     seen_selectors: set[str] = set()
@@ -213,6 +237,12 @@ def extract_elements(html: str) -> list[InteractiveElement]:
             continue
         if not _is_interactive(el):
             continue
+
+        # Mode filter: skip tags not in the allowed set, unless the element
+        # is also interactive via role/attr/tabindex/contenteditable.
+        if tag_filter and el.name not in tag_filter and not _has_non_tag_interactivity(el):
+            continue
+
         if eid_counter >= MAX_ELEMENTS:
             break
 
@@ -293,7 +323,7 @@ def get_page_summary(html: str) -> str:
     return text[:MAX_CONTENT_CHARS]
 
 
-def process_html(html: str) -> tuple[list[InteractiveElement], str]:
+def process_html(html: str, mode: str = "all_fields") -> tuple[list[InteractiveElement], str]:
     """
     Main entry point: extract interactive elements and page summary.
     Returns (elements, page_summary).
@@ -301,7 +331,7 @@ def process_html(html: str) -> tuple[list[InteractiveElement], str]:
     if not html or not html.strip():
         return [], ""
 
-    elements = extract_elements(html)
+    elements = extract_elements(html, mode=mode)
     summary = get_page_summary(html)
     return elements, summary
 
