@@ -65,10 +65,28 @@ def _extract_from_test(test: Any) -> dict[str, list[str]]:
             result["required_elements"].append(str(selector))
             result["hints"].append(f"Element should exist: {selector}")
 
+    # CheckEventTest — extract event criteria as human-readable hints
+    if "event" in test_type or "checkevent" in test_type:
+        event_name = _get(test, "event_name", "")
+        event_criteria = _get(test, "event_criteria", {}) or {}
+        if event_name:
+            result["hints"].append(f"Must trigger event: {event_name}")
+        if isinstance(event_criteria, dict):
+            for field_name, condition in event_criteria.items():
+                if isinstance(condition, dict):
+                    op = condition.get("operator", "")
+                    val = condition.get("value", "")
+                    result["hints"].append(f"  - {field_name} {op} {val}")
+                else:
+                    result["hints"].append(f"  - {field_name} = {condition}")
+
     # Generic value/condition tests
     if not any(result.values()):
         # Try to extract anything useful
-        for key in ["description", "name", "condition", "check"]:
+        desc = _get(test, "description", "")
+        if desc:
+            result["hints"].append(f"Test: {desc}")
+        for key in ["name", "condition", "check"]:
             val = _get(test, key, "")
             if val:
                 result["hints"].append(f"Test condition: {val}")

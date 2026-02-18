@@ -41,15 +41,19 @@ class WebAgent:
         self,
         openai_base_url: str,
         model: str = "gpt-4.1",
+        api_key: str = "",
     ):
         self.openai_base_url = openai_base_url.rstrip("/")
         self.model = model
+        self.api_key = api_key
         self.planner = Planner()
         self._task_analysis: Optional[TaskAnalysis] = None
         self._current_task_id: Optional[str] = None
         self._prev_elements: list[InteractiveElement] = []
         self._reasoning_memory: list[str] = []
         self._task_plan: list[str] = []
+        self._prev_url: str = ""
+        self._stale_count: int = 0
 
     async def decide_action(
         self,
@@ -76,6 +80,8 @@ class WebAgent:
             self._prev_elements = []
             self._reasoning_memory = []
             self._task_plan = []
+            self._prev_url = ""
+            self._stale_count = 0
 
         # 1. Analyze task (once per task)
         if self._task_analysis is None:
@@ -98,6 +104,11 @@ class WebAgent:
             f"Step {step_index}: {len(elements)} elements, "
             f"page_summary={len(page_summary)} chars, url={url[:80]}"
         )
+
+        # 2c. Self-verification: detect stale state
+        verification_notes = self._verify_action_result(url, elements, history)
+        if verification_notes:
+            logger.info(f"Verification: {verification_notes}")
 
         # 3. Check early completion (URL-based)
         if self._check_early_completion(url, snapshot_html):
@@ -122,6 +133,13 @@ class WebAgent:
         instruction = self._task_analysis.instruction
         memory_text = self._build_memory_text()
         plan_text = self._build_plan_text(step_index)
+        # Add verification warnings to form_warnings
+        form_warnings = self._check_form_completeness(elements)
+        if verification_notes:
+            if form_warnings:
+                form_warnings += "\n\n"
+            form_warnings += verification_notes
+
         user_prompt = build_user_prompt(
             instruction=instruction,
             current_url=url,
@@ -133,7 +151,7 @@ class WebAgent:
             planning_context=planning_context,
             dom_diff=dom_diff,
             memory_text=memory_text,
-            form_warnings=self._check_form_completeness(elements),
+            form_warnings=form_warnings,
             plan_text=plan_text,
         )
 
@@ -198,6 +216,73 @@ class WebAgent:
         # Only return True if we had criteria and all matched
         has_criteria = bool(analysis.url_targets or analysis.required_text)
         return has_criteria
+
+    def _verify_action_result(
+        self,
+        current_url: str,
+        current_elements: list[InteractiveElement],
+        history: list[dict],
+    ) -> str:
+        """Verify whether the last action had any effect.
+
+        Detects stale state (same URL and elements after clicking) and
+        generates warnings to steer the LLM toward a different strategy.
+        """
+        if not history:
+            self._prev_url = current_url
+            return ""
+
+        last = history[-1]
+        last_action = last.get("action", "")
+        prev_url = self._prev_url
+        self._prev_url = current_url
+
+        notes: list[str] = []
+
+        # Check if URL changed
+        url_changed = prev_url != current_url
+
+        # Detect stale state: clicking but nothing changes
+        if last_action in ("click", "scroll", "hover") and not url_changed:
+            self._stale_count += 1
+        else:
+            self._stale_count = 0
+
+        if self._stale_count >= 3:
+            notes.append(
+                f"## WARNING: Page has not changed after {self._stale_count} actions!\n"
+                "Your clicks/scrolls are having no effect. You MUST try a completely different approach:\n"
+                "- Use 'navigate' action to go directly to the URL you need (e.g. /contact, /search, /login)\n"
+                "- Try a different element or a different action type\n"
+                "- Look for select dropdowns, input fields, or links you haven't tried\n"
+                "- Do NOT repeat the same action that isn't working"
+            )
+
+        # Check if navigation action failed (URL didn't change)
+        if last_action == "navigate" and not url_changed:
+            notes.append(
+                "## WARNING: Navigation did not change the URL.\n"
+                "The URL you tried may be wrong. Check the URL format (include port number)."
+            )
+
+        # Check if form submission might have failed (clicked submit but still on same page)
+        if last_action == "click" and not url_changed and self._prev_elements:
+            new_alerts = [
+                e for e in current_elements
+                if not e.is_hidden and (
+                    "alert" in e.role
+                    or "error" in (e.classes or "").lower()
+                    or "error" in (e.text or "").lower()
+                    or "invalid" in (e.text or "").lower()
+                    or "required" in (e.text or "").lower()
+                )
+            ]
+            if new_alerts:
+                alert_texts = [e.text for e in new_alerts[:3] if e.text]
+                if alert_texts:
+                    notes.append(f"## Form Errors Detected\n{'; '.join(alert_texts)}")
+
+        return "\n\n".join(notes)
 
     def _build_plan_text(self, step_index: int) -> str:
         """Build the task plan section for the prompt.
@@ -354,6 +439,7 @@ class WebAgent:
                 headers={
                     "Content-Type": "application/json",
                     "iwa-task-id": task_id,
+                    **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}),
                 },
                 json={
                     "model": model,

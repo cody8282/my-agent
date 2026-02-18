@@ -30,7 +30,7 @@ SKIP_TAGS = {"script", "style", "noscript", "svg", "path", "meta", "link", "head
 
 MAX_TEXT_LEN = 80
 MAX_ELEMENTS = 150
-MAX_CONTENT_CHARS = 8000
+MAX_CONTENT_CHARS = 12000
 
 
 @dataclass
