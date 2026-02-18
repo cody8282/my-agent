@@ -247,10 +247,14 @@ def extract_elements(html: str, mode: str = "all_fields") -> list[InteractiveEle
             break
 
         css_sel = _build_css_selector(el)
-        # Deduplicate by css_selector (skip bare tag-only selectors from dedup)
-        if css_sel in seen_selectors and css_sel != el.name:
+        # Build a dedup key that distinguishes elements sharing Tailwind classes.
+        # Include href (for links) or name/text as differentiator.
+        dedup_extra = el.get("href", "") or el.get("name", "") or el.get_text(strip=True)[:40]
+        dedup_key = f"{css_sel}|{dedup_extra}"
+        # Deduplicate (skip bare tag-only selectors from dedup)
+        if dedup_key in seen_selectors and css_sel != el.name:
             continue
-        seen_selectors.add(css_sel)
+        seen_selectors.add(dedup_key)
 
         eid_counter += 1
         eid = f"e{eid_counter}"

@@ -40,23 +40,44 @@ agent = WebAgent(openai_base_url=OPENAI_BASE_URL, model=MODEL, api_key=OPENAI_AP
 
 
 _last_seen_base_url: str = ""
+_last_seen_seed: str = ""
 
 
 def _fix_navigate_url(url: str) -> str:
-    """Fix URLs where the LLM dropped the port number.
+    """Fix URLs where the LLM dropped the port number or seed parameter.
 
-    The LLM sometimes outputs http://localhost/path instead of http://localhost:8000/path.
-    We remember the base URL from the last request and fix it.
+    The IWA evaluator requires:
+    1. Correct port number (e.g. http://localhost:8000, not http://localhost)
+    2. Same seed parameter as the task URL (e.g. ?seed=549)
+
+    Without the seed, NavigateAction silently fails.
     """
     if not url or not _last_seen_base_url:
         return url
-    from urllib.parse import urlparse
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
     parsed = urlparse(url)
     base_parsed = urlparse(_last_seen_base_url)
-    # Only fix if same hostname and agent dropped the port
+
+    # Fix missing port
     if parsed.hostname == base_parsed.hostname and not parsed.port and base_parsed.port:
-        return url.replace(f"{parsed.scheme}://{parsed.hostname}", f"{parsed.scheme}://{parsed.hostname}:{base_parsed.port}", 1)
+        url = url.replace(
+            f"{parsed.scheme}://{parsed.hostname}",
+            f"{parsed.scheme}://{parsed.hostname}:{base_parsed.port}",
+            1,
+        )
+        parsed = urlparse(url)
+
+    # Fix missing seed parameter
+    if _last_seen_seed:
+        query_params = parse_qs(parsed.query)
+        if "seed" not in query_params:
+            if parsed.query:
+                new_query = parsed.query + f"&seed={_last_seen_seed}"
+            else:
+                new_query = f"seed={_last_seen_seed}"
+            url = urlunparse(parsed._replace(query=new_query))
+
     return url
 
 
@@ -85,7 +106,12 @@ def _to_iwa_action(action: dict) -> Optional[dict]:
         return result
 
     if action_type == "navigate":
-        url = _fix_navigate_url(action.get("url", ""))
+        raw_url = action.get("url", "")
+        url = _fix_navigate_url(raw_url)
+        if raw_url != url:
+            logger.info(f"Navigate URL fixed: {raw_url} -> {url}")
+        else:
+            logger.info(f"Navigate URL: {url}")
         return {"type": "NavigateAction", "url": url}
 
     if action_type == "go_back":
@@ -158,10 +184,15 @@ async def act(request: Request):
     step_index = body.get("step_index", 0)
     history = body.get("history", [])
 
-    # Remember base URL for navigate URL fixing
-    global _last_seen_base_url
+    # Remember base URL and seed for navigate URL fixing
+    global _last_seen_base_url, _last_seen_seed
     if url:
         _last_seen_base_url = url
+        # Extract seed parameter
+        from urllib.parse import parse_qs, urlparse
+        seed_vals = parse_qs(urlparse(url).query).get("seed", [])
+        if seed_vals:
+            _last_seen_seed = seed_vals[0]
 
     try:
         action = await agent.decide_action(
