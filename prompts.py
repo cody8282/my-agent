@@ -85,6 +85,9 @@ You can also construct your own xpath if the element you need isn't listed.
 - **Login tasks**: Look for a "Login" or "Sign in" link on the page. If there's no login link, look for a "Register" link — login pages are often accessible from the registration page. You can also try clicking user/account icons in the header.
 - **Logout tasks**: First log in, then look for a "Logout" or "Sign out" link/button, often in a user menu or header area.
 
+## Credentials
+When you see placeholder values like `<username>`, `<password>`, `<signup_username>`, or `<signup_email>` in form fields or page content, these ARE the actual credentials you must use. Type them exactly as shown, including the angle brackets (e.g. fill a username field with `<username>`, fill a password field with `<password>`). Do NOT invent your own credentials — always use the placeholders provided on the page.
+
 ## Task-Specific Guidance
 - **Filtering tasks**: Look for dropdown menus (`select` elements), genre/year filter inputs, or filter sidebar controls. These are often `select` elements with options like genre names or year values. Use `select_option` to choose filter values. If you don't see filter controls on the current page, click the "Search" link in the navigation — filter controls are usually on the search page. After selecting filters, look for an "Apply", "Filter", or "Search" button — or the filter may apply automatically.
 - **Search tasks**: Find the search input field, type the search query, then press Enter or click the search button. For "NOT equals" or negative search tasks, you still need to search for the item — the evaluator checks backend events, not the search query itself. Search for ANY movie (e.g. browse the catalog) that satisfies the NOT condition.

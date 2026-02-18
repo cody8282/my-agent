@@ -37,10 +37,10 @@ class WebAgent:
     planning, and structured output.
     """
 
-    # Multi-turn context settings
-    _MAX_HISTORY_TURNS = 2   # turns to keep (each turn = user + assistant msg)
-    _MAX_STORED_USER_CHARS = 4000   # truncation limit for stored user messages
-    _MAX_STORED_ASSISTANT_CHARS = 2000  # truncation limit for stored assistant messages
+    # Multi-turn context settings (generous budgets — COST_WEIGHT=0.0 in validator)
+    _MAX_HISTORY_TURNS = 3   # turns to keep (each turn = user + assistant msg)
+    _MAX_STORED_USER_CHARS = 8000   # truncation limit for stored user messages
+    _MAX_STORED_ASSISTANT_CHARS = 4000  # truncation limit for stored assistant messages
     # Minimum elements before adaptive fallback triggers
     _MIN_ELEMENTS_FOR_MODE = 5
 
