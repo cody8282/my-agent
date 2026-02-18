@@ -53,6 +53,8 @@ class WebAgent:
         self._reasoning_memory: list[str] = []
         self._task_plan: list[str] = []
         self._prev_url: str = ""
+        self._prev_page_summary: str = ""
+        self._last_action: Optional[dict] = None
         self._stale_count: int = 0
 
     async def decide_action(
@@ -81,6 +83,8 @@ class WebAgent:
             self._reasoning_memory = []
             self._task_plan = []
             self._prev_url = ""
+            self._prev_page_summary = ""
+            self._last_action = None
             self._stale_count = 0
 
         # 1. Analyze task (once per task)
@@ -98,7 +102,10 @@ class WebAgent:
 
         # 2b. Compute DOM diff from previous step
         dom_diff = compute_element_diff(self._prev_elements, elements)
+        prev_elements = self._prev_elements
+        prev_page_summary = self._prev_page_summary
         self._prev_elements = elements
+        self._prev_page_summary = page_summary
 
         logger.info(
             f"Step {step_index}: {len(elements)} elements, "
@@ -106,7 +113,9 @@ class WebAgent:
         )
 
         # 2c. Self-verification: detect stale state
-        verification_notes = self._verify_action_result(url, elements, history)
+        verification_notes = self._verify_action_result(
+            url, elements, history, prev_elements, prev_page_summary, page_summary
+        )
         if verification_notes:
             logger.info(f"Verification: {verification_notes}")
 
@@ -173,6 +182,9 @@ class WebAgent:
         if thinking:
             self._store_reasoning(step_index, thinking, action)
 
+        # 9. Store last action for next-step verification
+        self._last_action = action
+
         elapsed = time.monotonic() - start
         if action:
             logger.info(f"Step {step_index} decided: {action.get('type')} in {elapsed:.1f}s")
@@ -222,11 +234,14 @@ class WebAgent:
         current_url: str,
         current_elements: list[InteractiveElement],
         history: list[dict],
+        prev_elements: list[InteractiveElement],
+        prev_page_summary: str,
+        page_summary: str,
     ) -> str:
         """Verify whether the last action had any effect.
 
-        Detects stale state (same URL and elements after clicking) and
-        generates warnings to steer the LLM toward a different strategy.
+        Compares before/after state to detect stale pages, form errors,
+        fill failures, success signals, and navigation failures.
         """
         if not history:
             self._prev_url = current_url
@@ -258,31 +273,90 @@ class WebAgent:
                 "- Do NOT repeat the same action that isn't working"
             )
 
-        # Check if navigation action failed (URL didn't change)
+        # Check if navigation action failed (URL didn't change AND page is identical)
         if last_action == "navigate" and not url_changed:
-            notes.append(
-                "## WARNING: Navigation did not change the URL.\n"
-                "The URL you tried may be wrong. Check the URL format (include port number)."
-            )
-
-        # Check if form submission might have failed (clicked submit but still on same page)
-        if last_action == "click" and not url_changed and self._prev_elements:
-            new_alerts = [
-                e for e in current_elements
-                if not e.is_hidden and (
-                    "alert" in e.role
-                    or "error" in (e.classes or "").lower()
-                    or "error" in (e.text or "").lower()
-                    or "invalid" in (e.text or "").lower()
-                    or "required" in (e.text or "").lower()
+            if prev_page_summary and page_summary == prev_page_summary:
+                notes.append(
+                    "## WARNING: Navigation completely failed — URL and page content are identical.\n"
+                    "The URL you tried may be wrong or inaccessible. Check the URL format "
+                    "(include port number, correct path). Try a different URL."
                 )
-            ]
-            if new_alerts:
-                alert_texts = [e.text for e in new_alerts[:3] if e.text]
-                if alert_texts:
-                    notes.append(f"## Form Errors Detected\n{'; '.join(alert_texts)}")
+            else:
+                notes.append(
+                    "## WARNING: Navigation did not change the URL.\n"
+                    "The URL you tried may be wrong. Check the URL format (include port number)."
+                )
+
+        # Fill/type verification: check if target field value actually changed.
+        # Use self._last_action (stored from previous decide_action call) since
+        # history entries from the API don't include xpath/eid.
+        if last_action in ("fill", "type") and prev_elements and self._last_action:
+            target_xpath = self._last_action.get("xpath", "")
+            if target_xpath:
+                prev_el = self._find_element_by_xpath(prev_elements, target_xpath)
+                curr_el = self._find_element_by_xpath(current_elements, target_xpath)
+                if prev_el and curr_el and prev_el.value == curr_el.value:
+                    label = curr_el.placeholder or curr_el.name or curr_el.aria_label or curr_el.eid
+                    notes.append(
+                        f"## WARNING: Fill action may have failed — field '{label}' value is unchanged.\n"
+                        "The field may be read-only, or the selector didn't match. "
+                        "Try clicking the field first, or use a different selector."
+                    )
+
+        # Alert detection with true diff: only flag newly appeared alerts
+        if last_action == "click" and not url_changed:
+            prev_alert_texts = self._collect_alert_texts(prev_elements) if prev_elements else set()
+            curr_alert_texts = self._collect_alert_texts(current_elements)
+            new_alert_texts = curr_alert_texts - prev_alert_texts
+            if new_alert_texts:
+                notes.append(f"## Form Errors Detected\n{'; '.join(list(new_alert_texts)[:3])}")
+
+            # Success signal detection after click that didn't change URL.
+            # Compare by text content since eids are positional counters
+            # regenerated each step and not stable identifiers.
+            success_keywords = ("success", "thank you", "confirmed", "submitted", "order placed")
+            prev_texts = {e.text for e in prev_elements if e.text and not e.is_hidden} if prev_elements else set()
+            new_success: list[str] = []
+            for e in current_elements:
+                if e.is_hidden or not e.text:
+                    continue
+                if e.text in prev_texts:
+                    continue  # text existed on previous page
+                text_lower = e.text.lower()
+                if e.role == "status" or any(kw in text_lower for kw in success_keywords):
+                    new_success.append(e.text)
+            if new_success:
+                notes.append(f"## Success Signal Detected\n{'; '.join(new_success[:3])}")
 
         return "\n\n".join(notes)
+
+    @staticmethod
+    def _find_element_by_xpath(
+        elements: list[InteractiveElement], xpath: str
+    ) -> Optional[InteractiveElement]:
+        """Find an element by xpath (stable across steps, unlike eid)."""
+        for e in elements:
+            if e.xpath == xpath:
+                return e
+        return None
+
+    @staticmethod
+    def _collect_alert_texts(elements: list[InteractiveElement]) -> set[str]:
+        """Collect text from alert-like elements for diffing."""
+        texts: set[str] = set()
+        for e in elements:
+            if e.is_hidden:
+                continue
+            if (
+                "alert" in e.role
+                or "error" in (e.classes or "").lower()
+                or "error" in (e.text or "").lower()
+                or "invalid" in (e.text or "").lower()
+                or "required" in (e.text or "").lower()
+            ):
+                if e.text:
+                    texts.add(e.text)
+        return texts
 
     def _build_plan_text(self, step_index: int) -> str:
         """Build the task plan section for the prompt.
