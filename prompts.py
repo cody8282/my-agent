@@ -89,10 +89,41 @@ You can also construct your own xpath if the element you need isn't listed.
 When you see placeholder values like `<username>`, `<password>`, `<signup_username>`, or `<signup_email>` in form fields or page content, these ARE the actual credentials you must use. Type them exactly as shown, including the angle brackets (e.g. fill a username field with `<username>`, fill a password field with `<password>`). Do NOT invent your own credentials — always use the placeholders provided on the page.
 
 ## Task-Specific Guidance
-- **Filtering tasks**: Look for dropdown menus (`select` elements), genre/year filter inputs, or filter sidebar controls. These are often `select` elements with options like genre names or year values. Use `select_option` to choose filter values. If you don't see filter controls on the current page, click the "Search" link in the navigation — filter controls are usually on the search page. After selecting filters, look for an "Apply", "Filter", or "Search" button — or the filter may apply automatically.
-- **Search tasks**: Find the search input field, type the search query, then press Enter or click the search button. For "NOT equals" or negative search tasks, you still need to search for the item — the evaluator checks backend events, not the search query itself. Search for ANY movie (e.g. browse the catalog) that satisfies the NOT condition.
-- **Navigation to specific items**: Read the page content carefully to identify which items match the criteria (genre, duration, rating, director). Click on the item that matches ALL criteria. If you can't determine from the list view, click a candidate and check the detail page — use go_back if wrong.
+
+### Filtering & Search
+- **Filtering tasks**: Look for dropdown menus (`select` elements), genre/year filter inputs, or filter sidebar controls. Use `select_option` to choose filter values. If you don't see filter controls on the current page, click the "Search" link in the navigation — filter controls are usually on the search page. After selecting filters, look for an "Apply", "Filter", or "Search" button — or the filter may apply automatically.
+- **Search tasks**: Find the search input field, type the search query, then press Enter or click the search button. For "NOT equals" or negative search tasks, you still need to search for the item — the evaluator checks backend events, not the search query itself. Search for ANY item that satisfies the NOT condition.
+- **Sorting tasks**: Look for column headers that are clickable, or "Sort by" dropdowns. Click a column header to toggle sort direction. Some tables use arrow icons (▲/▼) to indicate sortable columns.
+
+### Navigation & Item Selection
+- **Navigation to specific items**: Read the page content carefully to identify which items match the criteria (genre, duration, rating, director, price, etc.). Click on the item that matches ALL criteria. If you can't determine from the list view, click a candidate and check the detail page — use go_back if wrong.
+- **Pagination**: If the item isn't on the current page, look for "Next", ">" buttons, or page number links at the bottom. Check pagination before concluding an item doesn't exist.
+
+### Forms & Contact
 - **Contact/form tasks**: If there's no "Contact" link visible in the navigation, use the "navigate" action to go to the /contact URL. Copy the full URL format from the current page (e.g. if current URL is http://localhost:8000/?seed=123, navigate to http://localhost:8000/contact?seed=123). THEN fill out the form fields.
+- **Date pickers**: Look for date input fields (`input[type="date"]`). Use "fill" to set the date in YYYY-MM-DD format. If it's a custom date picker widget, click the date input first, then look for a calendar popup and click the target date.
+- **Multi-step forms**: Some forms have multiple steps/pages. After filling the current step, look for a "Next" or "Continue" button. Fill ALL fields on each step before proceeding.
+
+### Email & Messaging
+- **Compose email tasks**: Look for a "Compose", "New Email", or "+" button. Click it to open the compose form. Fill in To, Subject, and Body fields. Click "Send" to submit.
+- **Reply/forward tasks**: First open the target email by clicking on it, then look for "Reply" or "Forward" buttons within the email view.
+- **Star/label tasks**: Find the target email in the list, then click the star icon or label button next to it. Some email apps require opening the email first.
+
+### Cart & E-commerce
+- **Add to cart tasks**: Navigate to the product page, then look for an "Add to Cart" button. You may need to select quantity, size, or color options first.
+- **Checkout tasks**: After adding items to cart, click the cart icon or "Cart" link, then look for a "Checkout" or "Proceed" button. Fill in required shipping/payment details.
+
+### Calendar & Booking
+- **Create event/booking tasks**: Look for a "New Event", "Create", or "+" button. Fill in the event title, date, time, and any other required fields. Click "Save" or "Create".
+- **Booking/reservation tasks**: Select the desired date and time slot, fill in guest details if required, then confirm the booking.
+
+### CRM & Data Management
+- **Create/edit contact/lead tasks**: Look for a "New" or "Add" button, fill in all required fields (name, email, phone, etc.), then save.
+- **Table interactions**: Click on a row to view details. Use column headers to sort. Look for edit/delete icons in each row for CRUD operations.
+
+### Modals & Dialogs
+- When a modal or dialog appears, focus your actions on elements INSIDE the modal. The modal content is usually at the top of the element list. Look for "Close", "X", "Cancel" to dismiss, or form fields and "Save"/"Submit"/"OK" buttons to interact.
+- If you need to dismiss a modal, try clicking "X", "Close", pressing Escape, or clicking outside the modal overlay.
 """
 
 

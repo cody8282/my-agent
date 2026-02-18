@@ -59,6 +59,7 @@ class InteractiveElement:
     xpath: str = ""
     is_hidden: bool = False
     is_required: bool = False
+    in_modal: bool = False
 
     def to_compact(self) -> str:
         """Single-line compact representation for the LLM prompt."""
@@ -86,6 +87,8 @@ class InteractiveElement:
             parts.append("[required]")
         if self.is_hidden:
             parts.append("[hidden]")
+        if self.in_modal:
+            parts.append("[modal]")
         # Always show xpath so the LLM knows how to target this element
         parts.append(f'xpath="{self.xpath}"')
         return " ".join(parts)
@@ -139,43 +142,81 @@ def _has_hidden_style(el: Tag) -> bool:
 
 
 def _build_css_selector(el: Tag) -> str:
-    """Build a CSS selector for the element, preferring id > name > classes."""
-    el_id = el.get("id", "")
-    if el_id:
-        return f"#{el_id}"
-    name = el.get("name", "")
+    """Build a CSS selector, preferring stable attributes over volatile ones."""
     tag = el.name or ""
+    # Prefer name (always stable)
+    name = el.get("name", "")
     if name:
         return f'{tag}[name="{name}"]'
-    # Use aria-label if available
+    # aria-label (stable)
     aria = el.get("aria-label", "")
     if aria:
         return f'{tag}[aria-label="{aria}"]'
+    # id only if stable
+    el_id = el.get("id", "")
+    if el_id and _is_stable_id(el_id):
+        return f"#{el_id}"
     # Fallback to tag + classes
     classes = el.get("class", [])
     if classes:
         cls_str = ".".join(c for c in classes if c)
         if cls_str:
             return f"{tag}.{cls_str}"
+    # Unstable id as last resort before bare tag
+    if el_id:
+        return f"#{el_id}"
     return tag
 
 
+_RE_STABLE_ID = re.compile(r"[a-zA-Z][a-zA-Z_-]{0,30}$")
+_RE_VARIANT_SUFFIX = re.compile(r"[-_]\d+$")
+_RE_HEX_LONG = re.compile(r"[0-9a-f]{8,}")
+
+
+def _is_stable_id(el_id: str) -> bool:
+    """Check if an HTML id looks stable (not a dynamic/seed-variant id).
+
+    Dynamic IDs from the anti-scraping system often contain trailing digits,
+    UUIDs, or variant suffixes like 'card-2', 'item-3-variant'.
+    """
+    # Short, simple IDs are usually stable (e.g. "submit", "email", "search")
+    if _RE_STABLE_ID.match(el_id):
+        return True
+    # IDs ending in digits after a separator are likely dynamic variants
+    if _RE_VARIANT_SUFFIX.search(el_id):
+        return False
+    # IDs with UUIDs or long hex strings are dynamic
+    if _RE_HEX_LONG.search(el_id):
+        return False
+    return True
+
+
 def _build_xpath(el: Tag) -> str:
-    """Build a reasonable XPath for the element."""
+    """Build a reasonable XPath for the element.
+
+    Prefers stable selectors (@name, @aria-label) over potentially volatile
+    ones (@id, @class) to handle seed-based dynamic attribute systems.
+    """
     tag = el.name or "*"
-    el_id = el.get("id", "")
-    if el_id:
-        return f'//*[@id="{el_id}"]'
+    # Prefer @name first — always stable across seeds
     name = el.get("name", "")
     if name:
         return f'//{tag}[@name="{name}"]'
+    # aria-label — stable, set by developers for accessibility
     aria = el.get("aria-label", "")
     if aria:
         return f'//{tag}[@aria-label="{aria}"]'
+    # @id — only if it looks stable (not a dynamic variant)
+    el_id = el.get("id", "")
+    if el_id and _is_stable_id(el_id):
+        return f'//*[@id="{el_id}"]'
     # Text-based (avoid quotes in text that would break XPath)
     text = el.get_text(strip=True)
     if text and len(text) < 50 and '"' not in text and "'" not in text:
         return f'//{tag}[contains(text(), "{text[:40]}")]'
+    # Unstable @id as fallback (better than class/positional)
+    if el_id:
+        return f'//*[@id="{el_id}"]'
     # Class-based fallback
     classes = el.get("class", [])
     if classes:
@@ -219,6 +260,56 @@ def _has_non_tag_interactivity(el: Tag) -> bool:
     return False
 
 
+def _is_inside_decoy(el: Tag) -> bool:
+    """Check if element is a decoy or nested inside a decoy/wrapper element."""
+    if el.get("data-decoy") is not None or el.get("data-dyn-wrap") is not None:
+        return True
+    for parent in list(el.parents)[:5]:
+        if isinstance(parent, Tag) and parent.name not in ("html", "body", "[document]"):
+            if parent.get("data-decoy") is not None:
+                return True
+    return False
+
+
+def _find_open_modals(soup: BeautifulSoup) -> list[Tag]:
+    """Find open modal/dialog containers in the DOM.
+
+    Detects modals via targeted queries (avoids full DOM walk):
+    - role="dialog" or role="alertdialog"
+    - <dialog open> elements
+    - aria-modal="true"
+    - data-state="open" with a role (Radix UI portals)
+    """
+    modals: list[Tag] = []
+    # role="dialog" or "alertdialog"
+    for el in soup.find_all(attrs={"role": re.compile(r"^(dialog|alertdialog)$", re.I)}):
+        modals.append(el)
+    # <dialog open>
+    for el in soup.find_all("dialog", attrs={"open": True}):
+        if el not in modals:
+            modals.append(el)
+    # aria-modal="true"
+    for el in soup.find_all(attrs={"aria-modal": "true"}):
+        if el not in modals:
+            modals.append(el)
+    return modals
+
+
+def _is_inside_modal(el: Tag, modal_set: set[int]) -> bool:
+    """Check if element is a descendant of any open modal container.
+
+    Uses id()-based set for O(1) membership checks.
+    """
+    if not modal_set:
+        return False
+    if id(el) in modal_set:
+        return True
+    for parent in el.parents:
+        if id(parent) in modal_set:
+            return True
+    return False
+
+
 def extract_elements(html: str, mode: str = "all_fields") -> list[InteractiveElement]:
     """Extract interactive elements from HTML, optionally filtered by mode."""
     try:
@@ -227,6 +318,8 @@ def extract_elements(html: str, mode: str = "all_fields") -> list[InteractiveEle
         soup = BeautifulSoup(html, "html.parser")
 
     tag_filter = EXTRACTION_MODES.get(mode)
+    modal_containers = _find_open_modals(soup)
+    modal_id_set = {id(m) for m in modal_containers}
 
     elements: list[InteractiveElement] = []
     seen_selectors: set[str] = set()
@@ -234,6 +327,9 @@ def extract_elements(html: str, mode: str = "all_fields") -> list[InteractiveEle
 
     for el in soup.find_all(True):
         if el.name in SKIP_TAGS:
+            continue
+        # Skip anti-scraping decoy elements and their children
+        if _is_inside_decoy(el):
             continue
         if not _is_interactive(el):
             continue
@@ -293,8 +389,18 @@ def extract_elements(html: str, mode: str = "all_fields") -> list[InteractiveEle
             xpath=xpath,
             is_hidden=_is_hidden(el),
             is_required=is_required,
+            in_modal=_is_inside_modal(el, modal_id_set),
         )
         elements.append(elem)
+
+    # When a modal is open, sort modal elements to top so LLM sees them first
+    if modal_containers:
+        modal_elems = [e for e in elements if e.in_modal]
+        non_modal_elems = [e for e in elements if not e.in_modal]
+        elements = modal_elems + non_modal_elems
+        # Re-assign eids so numbering matches display order
+        for i, elem in enumerate(elements, 1):
+            elem.eid = f"e{i}"
 
     return elements
 
@@ -426,12 +532,27 @@ def elements_to_prompt(elements: list[InteractiveElement]) -> str:
     if not elements:
         return "No interactive elements found on the page."
 
+    has_modal = any(e.in_modal for e in elements)
     visible = [e for e in elements if not e.is_hidden]
     hidden = [e for e in elements if e.is_hidden]
 
-    lines = ["Interactive elements:"]
-    for e in visible:
-        lines.append(f"  {e.to_compact()}")
+    lines: list[str] = []
+
+    if has_modal:
+        modal_visible = [e for e in visible if e.in_modal]
+        page_visible = [e for e in visible if not e.in_modal]
+        lines.append("** MODAL/DIALOG IS OPEN — focus on these elements first: **")
+        lines.append(f"Modal elements ({len(modal_visible)}):")
+        for e in modal_visible:
+            lines.append(f"  {e.to_compact()}")
+        if page_visible:
+            lines.append(f"\nBackground page elements ({len(page_visible)}):")
+            for e in page_visible:
+                lines.append(f"  {e.to_compact()}")
+    else:
+        lines.append("Interactive elements:")
+        for e in visible:
+            lines.append(f"  {e.to_compact()}")
 
     if hidden:
         lines.append(f"\nHidden elements ({len(hidden)}):")

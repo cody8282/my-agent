@@ -21,6 +21,99 @@ _EXTRACTION_MODE_MAP = {
     "navigation": "links_only",
 }
 
+# Exact event name → actionable LLM guidance
+_EVENT_ACTION_MAP: dict[str, str] = {
+    # Auth
+    "LOGIN": "Log in with the provided credentials",
+    "LOGIN_BOOK": "Log in with the provided credentials",
+    "REGISTRATION": "Register a new account with the provided details",
+    "REGISTRATION_BOOK": "Register a new account with the provided details",
+    "LOGOUT": "Log out of the current session",
+    "LOGOUT_BOOK": "Log out of the current session",
+    # Email
+    "SEND_EMAIL": "Compose and send an email",
+    "REPLY_EMAIL": "Reply to the specified email",
+    "FORWARD_EMAIL": "Forward the specified email",
+    "VIEW_EMAIL": "Open and view the specified email",
+    "STAR_AN_EMAIL": "Star/unstar the specified email",
+    "DELETE_EMAIL": "Delete the specified email",
+    "ARCHIVE_EMAIL": "Archive the specified email",
+    "SEARCH_EMAIL": "Search for the specified email",
+    "MARK_AS_SPAM": "Mark the specified email as spam",
+    "MARK_AS_UNREAD": "Mark the specified email as unread",
+    "MARK_EMAIL_AS_IMPORTANT": "Mark the specified email as important",
+    "ADD_LABEL": "Add a label to the specified email",
+    # Contact / form
+    "CONTACT": "Fill out and submit the contact form",
+    "CONTACT_FORM_SUBMIT": "Fill out and submit the contact form",
+    "CONTACT_DOCTOR": "Contact the specified doctor",
+    # Cart / purchase
+    "ADD_TO_CART": "Add the specified item to the cart",
+    "ADD_TO_CART_BOOK": "Add the specified book to the cart",
+    "ADD_TO_CART_MENU_ITEM": "Add the specified menu item to the cart",
+    "PLACE_ORDER": "Place an order",
+    "ORDER_COMPLETED": "Complete the order",
+    "PROCEED_TO_CHECKOUT": "Proceed to checkout",
+    "CHECKOUT_STARTED": "Start the checkout process",
+    "CONFIRM_AND_PAY": "Confirm and complete payment",
+    "PURCHASE_BOOK": "Purchase the specified book",
+    # Review
+    "SUBMIT_REVIEW": "Write and submit a review",
+    "REVIEW_SUBMITTED": "Write and submit a review",
+    # Booking / reservation
+    "BOOK_RESTAURANT": "Book a reservation at the specified restaurant",
+    "RESERVE_HOTEL": "Reserve the specified hotel",
+    "RESERVE_RIDE": "Reserve a ride",
+    "RESERVATION_COMPLETE": "Complete the reservation",
+    "CANCEL_RESERVATION": "Cancel the specified reservation",
+    "APPOINTMENT_BOOKED_SUCCESSFULLY": "Book an appointment",
+    # Calendar
+    "NEW_CALENDAR_EVENT_ADDED": "Create a new calendar event",
+    "ADD_EVENT": "Create a new event",
+    # Social
+    "LIKE_POST": "Like the specified post",
+    "COMMENT_ON_POST": "Comment on the specified post",
+    "POST_STATUS": "Post a status update",
+    "CONNECT_WITH_USER": "Connect with the specified user",
+    # Jobs
+    "APPLY_FOR_JOB": "Apply for the specified job",
+    "POST_A_JOB": "Post a new job listing",
+}
+
+# Prefix-based patterns for the ~285 event names we can't map individually.
+# Checked in order; first match wins.
+_EVENT_PREFIX_MAP: list[tuple[str, str]] = [
+    ("VIEW_", "Navigate to and view the specified item"),
+    ("SEARCH_", "Search for the specified item"),
+    ("FILTER_", "Apply the specified filter"),
+    ("SORT_", "Sort by the specified criteria"),
+    ("ADD_TO_CART", "Add the specified item to the cart"),
+    ("ADD_TO_", "Add the item to the specified list"),
+    ("ADD_", "Add the specified item"),
+    ("REMOVE_FROM_", "Remove from the specified list"),
+    ("DELETE_", "Delete the specified item"),
+    ("EDIT_", "Edit the specified item"),
+    ("SHARE_", "Share the specified item"),
+    ("SELECT_", "Select the specified option"),
+    ("OPEN_", "Open the specified page or form"),
+    ("CREATE_", "Create a new item"),
+    ("CANCEL_", "Cancel the specified action"),
+]
+
+# Human-readable operator labels
+_OPERATOR_LABELS: dict[str, str] = {
+    "equals": "must be",
+    "not_equals": "must NOT be",
+    "contains": "must contain",
+    "not_contains": "must NOT contain",
+    "greater_than": "must be greater than",
+    "less_than": "must be less than",
+    "greater_equal": "must be at least",
+    "less_equal": "must be at most",
+    "in_list": "must be one of",
+    "not_in_list": "must NOT be one of",
+}
+
 
 @dataclass
 class TaskAnalysis:
@@ -30,6 +123,8 @@ class TaskAnalysis:
     required_text: list[str] = field(default_factory=list)  # Text that must appear
     required_elements: list[str] = field(default_factory=list)  # Elements that must exist
     completion_hints: list[str] = field(default_factory=list)  # Human-readable goals
+    action_hints: list[str] = field(default_factory=list)  # "Compose and send an email"
+    field_hints: list[str] = field(default_factory=list)  # "'subject' must contain: ..."
     instruction: str = ""
     extraction_mode: str = "all_fields"  # input_fields, links_only, all_fields
 
@@ -41,6 +136,8 @@ def _extract_from_test(test: Any) -> dict[str, list[str]]:
         "required_text": [],
         "required_elements": [],
         "hints": [],
+        "action_hints": [],   # "Action required: ..." lines
+        "field_hints": [],    # "Required field values:" + indented lines
     }
 
     # Handle both dict and object access
@@ -73,20 +170,38 @@ def _extract_from_test(test: Any) -> dict[str, list[str]]:
             result["required_elements"].append(str(selector))
             result["hints"].append(f"Element should exist: {selector}")
 
-    # CheckEventTest — extract event criteria as human-readable hints
+    # CheckEventTest — extract event criteria as actionable guidance
     if "event" in test_type or "checkevent" in test_type:
         event_name = _get(test, "event_name", "")
         event_criteria = _get(test, "event_criteria", {}) or {}
         if event_name:
-            result["hints"].append(f"Must trigger event: {event_name}")
-        if isinstance(event_criteria, dict):
+            action_desc = _EVENT_ACTION_MAP.get(event_name)
+            if not action_desc:
+                # Try prefix-based matching
+                for prefix, desc in _EVENT_PREFIX_MAP:
+                    if event_name.startswith(prefix):
+                        action_desc = desc
+                        break
+            if action_desc:
+                result["action_hints"].append(action_desc)
+            else:
+                # Final fallback: humanize the event name
+                readable = event_name.replace("_", " ").title()
+                result["action_hints"].append(readable)
+        if isinstance(event_criteria, dict) and event_criteria:
             for field_name, condition in event_criteria.items():
+                readable_field = field_name.replace("_", " ")
                 if isinstance(condition, dict):
-                    op = condition.get("operator", "")
+                    op = condition.get("operator", "equals")
                     val = condition.get("value", "")
-                    result["hints"].append(f"  - {field_name} {op} {val}")
+                    op_label = _OPERATOR_LABELS.get(op, op)
+                    if isinstance(val, list):
+                        val_str = ", ".join(str(v) for v in val)
+                        result["field_hints"].append(f"'{readable_field}' {op_label}: [{val_str}]")
+                    else:
+                        result["field_hints"].append(f"'{readable_field}' {op_label}: \"{val}\"")
                 else:
-                    result["hints"].append(f"  - {field_name} = {condition}")
+                    result["field_hints"].append(f"'{readable_field}' must be: \"{condition}\"")
 
     # Generic value/condition tests
     if not any(result.values()):
@@ -160,12 +275,14 @@ def analyze_task(task: dict[str, Any]) -> TaskAnalysis:
             analysis.required_text.extend(extracted["required_text"])
             analysis.required_elements.extend(extracted["required_elements"])
             analysis.completion_hints.extend(extracted["hints"])
+            analysis.action_hints.extend(extracted["action_hints"])
+            analysis.field_hints.extend(extracted["field_hints"])
         except Exception as e:
             logger.debug(f"Failed to extract from test: {e}")
             continue
 
     # Add instruction-derived hints
-    if not analysis.completion_hints:
+    if not analysis.completion_hints and not analysis.action_hints:
         analysis.completion_hints.append(f"Complete the task: {instruction}")
 
     # Deduplicate
@@ -173,6 +290,8 @@ def analyze_task(task: dict[str, Any]) -> TaskAnalysis:
     analysis.required_text = list(dict.fromkeys(analysis.required_text))
     analysis.required_elements = list(dict.fromkeys(analysis.required_elements))
     analysis.completion_hints = list(dict.fromkeys(analysis.completion_hints))
+    analysis.action_hints = list(dict.fromkeys(analysis.action_hints))
+    analysis.field_hints = list(dict.fromkeys(analysis.field_hints))
 
     return analysis
 
@@ -181,9 +300,19 @@ def analysis_to_prompt(analysis: TaskAnalysis) -> str:
     """Format task analysis as a prompt section for the LLM."""
     lines = ["## Success Criteria"]
 
-    if analysis.completion_hints:
-        for hint in analysis.completion_hints:
-            lines.append(f"- {hint}")
+    # Action hints first (most important — tells LLM what to DO)
+    for hint in analysis.action_hints:
+        lines.append(f"- Action required: {hint}")
+
+    # Field requirements grouped together
+    if analysis.field_hints:
+        lines.append("- Required field values:")
+        for hint in analysis.field_hints:
+            lines.append(f"  - {hint}")
+
+    # General completion hints
+    for hint in analysis.completion_hints:
+        lines.append(f"- {hint}")
 
     if analysis.url_targets:
         lines.append("\nTarget URLs:")
